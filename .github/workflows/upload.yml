@@ -53,7 +53,7 @@ jobs:
           api_id = int(os.environ["TELEGRAM_API_ID"])
           api_hash = os.environ["TELEGRAM_API_HASH"]
           session = os.environ["TELEGRAM_SESSION"]
-          chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
+          target_id = int(os.environ["TELEGRAM_CHAT_ID"])
 
           files = [
               f for f in glob.glob("downloads/*")
@@ -75,41 +75,77 @@ jobs:
               api_hash
           )
 
-          start_time = time.time()
+          async def main():
+              print("Connecting to Telegram...")
+              await client.connect()
 
-          def progress(current, total):
-              elapsed = time.time() - start_time
+              if not await client.is_user_authorized():
+                  raise RuntimeError("Telegram session is not authorized.")
 
-              if elapsed <= 0:
-                  return
+              print("Session authorized.")
+              print("Searching for target user...")
 
-              speed = current / 1024 / 1024 / elapsed
-              percent = current * 100 / total
+              target = None
+
+              async for dialog in client.iter_dialogs():
+                  if (
+                      dialog.entity
+                      and getattr(dialog.entity, "id", None) == target_id
+                  ):
+                      target = dialog.entity
+                      break
+
+              if target is None:
+                  raise RuntimeError(
+                      f"Target user {target_id} was not found in the "
+                      "uploader account's dialogs. "
+                      "Make sure the uploader account has an existing "
+                      "chat with the target account."
+                  )
 
               print(
-                  f"\rUpload: {percent:.1f}% | "
-                  f"{speed:.2f} MB/s",
-                  end="",
-                  flush=True
+                  f"Target found: "
+                  f"{getattr(target, 'first_name', '')}"
               )
 
-          async def main():
+              start_time = time.time()
+
+              def progress(current, total):
+                  elapsed = time.time() - start_time
+
+                  if elapsed <= 0:
+                      return
+
+                  speed = current / 1024 / 1024 / elapsed
+                  percent = current * 100 / total
+
+                  print(
+                      f"\rUpload: {percent:.1f}% | "
+                      f"{speed:.2f} MB/s",
+                      end="",
+                      flush=True
+                  )
+
+              print("Starting upload...")
+
               await client.send_file(
-                  chat_id,
+                  target,
                   file_path,
                   force_document=True,
                   progress_callback=progress
               )
 
+              elapsed = time.time() - start_time
+              speed = file_size / 1024 / 1024 / elapsed
+
+              print()
+              print("Upload completed!")
+              print(f"Average upload speed: {speed:.2f} MB/s")
+
+              await client.disconnect()
+
           with client:
               client.loop.run_until_complete(main())
-
-          elapsed = time.time() - start_time
-          speed = file_size / 1024 / 1024 / elapsed
-
-          print()
-          print("Upload completed!")
-          print(f"Average upload speed: {speed:.2f} MB/s")
           PY
 
           python upload.py
