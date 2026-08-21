@@ -45,7 +45,6 @@ jobs:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           printf '%s' "$YOUTUBE_COOKIES" > youtube-cookies.txt
-
           chmod 600 youtube-cookies.txt
 
           if [ ! -s youtube-cookies.txt ]; then
@@ -79,6 +78,7 @@ jobs:
             yt-dlp \
               --cookies youtube-cookies.txt \
               --js-runtimes node \
+              --remote-components ejs:github \
               --newline \
               --progress \
               --no-playlist \
@@ -112,6 +112,7 @@ jobs:
             yt-dlp \
               --cookies youtube-cookies.txt \
               --js-runtimes node \
+              --remote-components ejs:github \
               --newline \
               --progress \
               --no-playlist \
