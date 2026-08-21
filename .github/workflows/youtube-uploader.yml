@@ -1,1 +1,328 @@
+name: YouTube Downloader & Uploader
 
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "YouTube URL"
+        required: true
+        type: string
+
+      download_type:
+        description: "Download type"
+        required: true
+        type: choice
+        options:
+          - video
+          - audio
+
+      quality:
+        description: "Video quality"
+        required: true
+        type: choice
+        options:
+          - best
+          - 1080
+          - 720
+          - 480
+
+jobs:
+  youtube-download-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install yt-dlp telethon cryptg
+
+      - name: Download YouTube video
+        env:
+          YOUTUBE_URL: ${{ inputs.url }}
+          DOWNLOAD_TYPE: ${{ inputs.download_type }}
+          QUALITY: ${{ inputs.quality }}
+        run: |
+
+          mkdir -p downloads
+
+          echo "========================================"
+          echo "YouTube Downloader"
+          echo "========================================"
+
+          echo "Type: $DOWNLOAD_TYPE"
+          echo "Quality: $QUALITY"
+          echo ""
+
+          if [ "$DOWNLOAD_TYPE" = "audio" ]; then
+
+            echo "Downloading best audio..."
+
+            yt-dlp \
+              --newline \
+              --progress \
+              --no-playlist \
+              -f "bestaudio/best" \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality 0 \
+              -o "downloads/%(title)s.%(ext)s" \
+              "$YOUTUBE_URL"
+
+          else
+
+            if [ "$QUALITY" = "best" ]; then
+              FORMAT="bestvideo*+bestaudio/best"
+
+            elif [ "$QUALITY" = "1080" ]; then
+              FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+
+            elif [ "$QUALITY" = "720" ]; then
+              FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+
+            elif [ "$QUALITY" = "480" ]; then
+              FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+            fi
+
+            echo "Format: $FORMAT"
+            echo ""
+
+            echo "Downloading video + audio..."
+
+            yt-dlp \
+              --newline \
+              --progress \
+              --no-playlist \
+              -f "$FORMAT" \
+              --merge-output-format mp4 \
+              -o "downloads/%(title)s.%(ext)s" \
+              "$YOUTUBE_URL"
+
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "Download completed!"
+          echo "========================================"
+
+          ls -lh downloads
+
+      - name: Find downloaded file
+        run: |
+
+          FILE=$(find downloads -maxdepth 1 -type f | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: No downloaded file found."
+            exit 1
+          fi
+
+          echo "Downloaded file:"
+          echo "$(basename "$FILE")"
+
+          echo ""
+          echo "File size:"
+          du -h "$FILE"
+
+      - name: Upload to Telegram
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+
+          cat > upload.py <<'PY'
+
+          import os
+          import glob
+          import time
+
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+          api_id = int(os.environ["TELEGRAM_API_ID"])
+          api_hash = os.environ["TELEGRAM_API_HASH"]
+          session = os.environ["TELEGRAM_SESSION"]
+          target_id = int(os.environ["TELEGRAM_CHAT_ID"])
+
+          files = [
+              f
+              for f in glob.glob("downloads/*")
+              if os.path.isfile(f)
+          ]
+
+          if not files:
+              raise RuntimeError(
+                  "No downloaded file found."
+              )
+
+          file_path = files[0]
+          file_name = os.path.basename(file_path)
+          file_size = os.path.getsize(file_path)
+
+          print("========================================")
+          print("Telegram Upload")
+          print("========================================")
+
+          print(f"File: {file_name}")
+          print(
+              f"Size: "
+              f"{file_size / 1024 / 1024:.2f} MB"
+          )
+
+          client = TelegramClient(
+              StringSession(session),
+              api_id,
+              api_hash
+          )
+
+          async def main():
+
+              print()
+              print("Connecting to Telegram...")
+
+              await client.connect()
+
+              if not await client.is_user_authorized():
+                  raise RuntimeError(
+                      "Telegram session is not authorized."
+                  )
+
+              print("Session authorized.")
+
+              print("Searching for target user...")
+
+              target = None
+
+              async for dialog in client.iter_dialogs():
+
+                  if (
+                      dialog.entity
+                      and getattr(
+                          dialog.entity,
+                          "id",
+                          None
+                      ) == target_id
+                  ):
+                      target = dialog.entity
+                      break
+
+              if target is None:
+                  raise RuntimeError(
+                      f"Target user {target_id} was not found "
+                      "in the uploader account's dialogs."
+                  )
+
+              print("Target found.")
+
+              print()
+              print("Starting upload...")
+
+              start_time = time.time()
+              last_update = 0
+
+              def progress(current, total):
+
+                  nonlocal last_update
+
+                  now = time.time()
+
+                  if (
+                      now - last_update < 1
+                      and current < total
+                  ):
+                      return
+
+                  last_update = now
+
+                  elapsed = now - start_time
+
+                  if elapsed <= 0:
+                      return
+
+                  percent = current * 100 / total
+
+                  speed = (
+                      current / 1024 / 1024
+                  ) / elapsed
+
+                  uploaded_mb = (
+                      current / 1024 / 1024
+                  )
+
+                  total_mb = (
+                      total / 1024 / 1024
+                  )
+
+                  print(
+                      f"\r"
+                      f"Upload: {percent:6.2f}% | "
+                      f"{uploaded_mb:.1f}/"
+                      f"{total_mb:.1f} MB | "
+                      f"{speed:.2f} MB/s",
+                      end="",
+                      flush=True
+                  )
+
+              await client.send_file(
+                  target,
+                  file_path,
+                  force_document=True,
+                  progress_callback=progress
+              )
+
+              elapsed = time.time() - start_time
+
+              average_speed = (
+                  file_size / 1024 / 1024
+              ) / elapsed
+
+              print()
+              print()
+              print("========================================")
+              print("UPLOAD COMPLETED!")
+              print("========================================")
+
+              print(f"File: {file_name}")
+
+              print(
+                  f"Size: "
+                  f"{file_size / 1024 / 1024:.2f} MB"
+              )
+
+              print(
+                  f"Average upload speed: "
+                  f"{average_speed:.2f} MB/s"
+              )
+
+              print(
+                  f"Upload time: "
+                  f"{elapsed:.1f} seconds"
+              )
+
+              print("========================================")
+
+              await client.disconnect()
+
+          with client:
+              client.loop.run_until_complete(main())
+
+          PY
+
+          python upload.py
+
+      - name: Cleanup
+        if: always()
+        run: |
+
+          echo "Cleaning temporary files..."
+
+          rm -rf downloads
+          rm -f upload.py
+
+          echo "Cleanup completed."
