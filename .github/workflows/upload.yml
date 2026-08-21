@@ -11,6 +11,7 @@ on:
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Install dependencies
@@ -26,14 +27,46 @@ jobs:
         run: |
           mkdir -p downloads
 
+          echo "========================================"
+          echo "Starting download..."
+          echo "========================================"
+
           aria2c \
             --dir=downloads \
+            --continue=true \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --file-allocation=none \
             --split=8 \
             --max-connection-per-server=8 \
             --min-split-size=10M \
-            --continue=true \
+            --max-tries=10 \
+            --retry-wait=3 \
+            --connect-timeout=10 \
+            --timeout=60 \
+            --download-result=full \
             --summary-interval=5 \
             "$FILE_URL"
+
+          echo ""
+          echo "========================================"
+          echo "Download completed!"
+          echo "========================================"
+
+          ls -lh downloads
+
+      - name: Show downloaded file
+        run: |
+          FILE=$(find downloads -maxdepth 1 -type f | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: No file found."
+            exit 1
+          fi
+
+          echo "File: $(basename "$FILE")"
+          echo "Size:"
+          du -h "$FILE"
 
       - name: Upload to Telegram
         env:
@@ -63,11 +96,17 @@ jobs:
           if not files:
               raise RuntimeError("No downloaded file found.")
 
+          if len(files) > 1:
+              print("Multiple files found. Using the first one.")
+
           file_path = files[0]
+          file_name = os.path.basename(file_path)
           file_size = os.path.getsize(file_path)
 
-          print(f"File: {os.path.basename(file_path)}")
+          print("========================================")
+          print(f"File: {file_name}")
           print(f"Size: {file_size / 1024 / 1024:.2f} MB")
+          print("========================================")
 
           client = TelegramClient(
               StringSession(session),
@@ -76,31 +115,36 @@ jobs:
           )
 
           async def main():
+
               print("Connecting to Telegram...")
+
               await client.connect()
 
               if not await client.is_user_authorized():
-                  raise RuntimeError("Telegram session is not authorized.")
+                  raise RuntimeError(
+                      "Telegram session is not authorized."
+                  )
 
               print("Session authorized.")
+
               print("Searching for target user...")
 
               target = None
 
               async for dialog in client.iter_dialogs():
+
                   if (
                       dialog.entity
-                      and getattr(dialog.entity, "id", None) == target_id
+                      and getattr(dialog.entity, "id", None)
+                      == target_id
                   ):
                       target = dialog.entity
                       break
 
               if target is None:
                   raise RuntimeError(
-                      f"Target user {target_id} was not found in the "
-                      "uploader account's dialogs. "
-                      "Make sure the uploader account has an existing "
-                      "chat with the target account."
+                      f"Target user {target_id} was not found "
+                      "in the uploader account's dialogs."
                   )
 
               print(
@@ -108,25 +152,51 @@ jobs:
                   f"{getattr(target, 'first_name', '')}"
               )
 
+              print()
+              print("Starting Telegram upload...")
+              print()
+
               start_time = time.time()
+              last_update = 0
 
               def progress(current, total):
-                  elapsed = time.time() - start_time
+
+                  nonlocal last_update
+
+                  now = time.time()
+
+                  if now - last_update < 1 and current < total:
+                      return
+
+                  last_update = now
+
+                  elapsed = now - start_time
 
                   if elapsed <= 0:
                       return
 
-                  speed = current / 1024 / 1024 / elapsed
                   percent = current * 100 / total
 
+                  speed = (
+                      current / 1024 / 1024
+                  ) / elapsed
+
+                  uploaded_mb = (
+                      current / 1024 / 1024
+                  )
+
+                  total_mb = (
+                      total / 1024 / 1024
+                  )
+
                   print(
-                      f"\rUpload: {percent:.1f}% | "
+                      f"\r"
+                      f"Upload: {percent:6.2f}% | "
+                      f"{uploaded_mb:.1f}/{total_mb:.1f} MB | "
                       f"{speed:.2f} MB/s",
                       end="",
                       flush=True
                   )
-
-              print("Starting upload...")
 
               await client.send_file(
                   target,
@@ -136,21 +206,48 @@ jobs:
               )
 
               elapsed = time.time() - start_time
-              speed = file_size / 1024 / 1024 / elapsed
+
+              average_speed = (
+                  file_size / 1024 / 1024
+              ) / elapsed
 
               print()
-              print("Upload completed!")
-              print(f"Average upload speed: {speed:.2f} MB/s")
+              print()
+              print("========================================")
+              print("UPLOAD COMPLETED!")
+              print("========================================")
+              print(f"File: {file_name}")
+              print(
+                  f"Size: "
+                  f"{file_size / 1024 / 1024:.2f} MB"
+              )
+              print(
+                  f"Average upload speed: "
+                  f"{average_speed:.2f} MB/s"
+              )
+              print(
+                  f"Upload time: "
+                  f"{elapsed:.1f} seconds"
+              )
+              print("========================================")
 
               await client.disconnect()
 
           with client:
               client.loop.run_until_complete(main())
+
           PY
 
           python upload.py
 
+      - name: Verify upload step
+        run: |
+          echo "Telegram upload step completed successfully."
+
       - name: Cleanup
         if: always()
         run: |
+          echo "Cleaning temporary files..."
           rm -rf downloads
+          rm -f upload.py
+          echo "Cleanup completed."
