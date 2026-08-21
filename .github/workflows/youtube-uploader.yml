@@ -29,9 +29,13 @@ on:
 jobs:
   youtube-download-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
+
+      # ==========================================
+      # INSTALL
+      # ==========================================
 
       - name: Install dependencies
         run: |
@@ -39,6 +43,10 @@ jobs:
           sudo apt-get install -y ffmpeg nodejs
           python -m pip install --upgrade pip
           pip install -U yt-dlp telethon cryptg
+
+      # ==========================================
+      # CREATE YOUTUBE COOKIES
+      # ==========================================
 
       - name: Create YouTube cookies file
         env:
@@ -54,7 +62,11 @@ jobs:
 
           echo "YouTube cookies loaded successfully."
 
-      - name: Download YouTube video
+      # ==========================================
+      # DOWNLOAD
+      # ==========================================
+
+      - name: Download from YouTube
         env:
           YOUTUBE_URL: ${{ inputs.url }}
           DOWNLOAD_TYPE: ${{ inputs.download_type }}
@@ -130,6 +142,215 @@ jobs:
 
           ls -lh downloads
 
+      # ==========================================
+      # PROCESS VIDEO
+      # ==========================================
+
+      - name: Check and optimize video
+        if: inputs.download_type == 'video'
+        run: |
+
+          FILE=$(find downloads -maxdepth 1 -type f | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: No downloaded file found."
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Checking video"
+          echo "========================================"
+
+          echo "File:"
+          echo "$(basename "$FILE")"
+
+          echo ""
+
+          VIDEO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          AUDIO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          WIDTH=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=width \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          HEIGHT=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=height \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          FORMAT_NAME=$(ffprobe \
+            -v error \
+            -show_entries format=format_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          echo "Video codec: $VIDEO_CODEC"
+          echo "Audio codec: $AUDIO_CODEC"
+          echo "Resolution: ${WIDTH}x${HEIGHT}"
+          echo "Format: $FORMAT_NAME"
+          echo "Duration: ${DURATION}s"
+
+          NEED_CONVERSION=false
+
+          if [ "$VIDEO_CODEC" != "h264" ]; then
+            NEED_CONVERSION=true
+          fi
+
+          if [ "$AUDIO_CODEC" != "aac" ]; then
+            NEED_CONVERSION=true
+          fi
+
+          if [[ "$FORMAT_NAME" != *"mp4"* ]]; then
+            NEED_CONVERSION=true
+          fi
+
+          echo ""
+          echo "Conversion required: $NEED_CONVERSION"
+
+          if [ "$NEED_CONVERSION" = "true" ]; then
+
+            echo ""
+            echo "========================================"
+            echo "Converting video"
+            echo "========================================"
+
+            OUTPUT="downloads/converted_video.mp4"
+
+            ffmpeg \
+              -y \
+              -i "$FILE" \
+              -map 0:v:0 \
+              -map 0:a:0? \
+              -c:v libx264 \
+              -preset veryfast \
+              -crf 18 \
+              -c:a aac \
+              -b:a 192k \
+              -movflags +faststart \
+              "$OUTPUT"
+
+            rm -f "$FILE"
+
+            mv "$OUTPUT" "downloads/final_video.mp4"
+
+            FILE="downloads/final_video.mp4"
+
+            echo "Conversion completed."
+
+          else
+
+            echo ""
+            echo "========================================"
+            echo "No conversion required"
+            echo "========================================"
+
+            OUTPUT="downloads/final_video.mp4"
+
+            ffmpeg \
+              -y \
+              -i "$FILE" \
+              -c copy \
+              -movflags +faststart \
+              "$OUTPUT"
+
+            rm -f "$FILE"
+
+            FILE="$OUTPUT"
+
+            echo "Fast-start optimization completed."
+
+          fi
+
+          # ======================================
+          # FINAL VIDEO INFO
+          # ======================================
+
+          VIDEO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          AUDIO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          WIDTH=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=width \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          HEIGHT=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=height \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
+          FILE_SIZE=$(stat -c%s "$FILE")
+
+          FILE_SIZE_MB=$(awk \
+            "BEGIN {printf \"%.2f\", $FILE_SIZE/1024/1024}")
+
+          if [ "$NEED_CONVERSION" = "true" ]; then
+            CONVERTED="Yes"
+          else
+            CONVERTED="No"
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "FINAL VIDEO"
+          echo "========================================"
+
+          echo "Resolution: ${WIDTH}x${HEIGHT}"
+          echo "Video codec: $VIDEO_CODEC"
+          echo "Audio codec: $AUDIO_CODEC"
+          echo "Converted: $CONVERTED"
+          echo "Size: ${FILE_SIZE_MB} MB"
+
+          echo ""
+
+          cat > video_info.txt <<EOF
+          Resolution: ${WIDTH}x${HEIGHT}
+          Video codec: ${VIDEO_CODEC}
+          Audio codec: ${AUDIO_CODEC}
+          Converted: ${CONVERTED}
+          Size: ${FILE_SIZE_MB} MB
+          EOF
+
+      # ==========================================
+      # FIND FILE
+      # ==========================================
+
       - name: Find downloaded file
         run: |
 
@@ -140,12 +361,19 @@ jobs:
             exit 1
           fi
 
-          echo "Downloaded file:"
-          echo "$(basename "$FILE")"
+          echo "========================================"
+          echo "Final file"
+          echo "========================================"
+
+          echo "File: $(basename "$FILE")"
 
           echo ""
-          echo "File size:"
+          echo "Size:"
           du -h "$FILE"
+
+      # ==========================================
+      # UPLOAD TO TELEGRAM
+      # ==========================================
 
       - name: Upload to Telegram
         env:
@@ -153,6 +381,7 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DOWNLOAD_TYPE: ${{ inputs.download_type }}
 
         run: |
 
@@ -161,6 +390,7 @@ jobs:
           import os
           import glob
           import time
+          import subprocess
 
           from telethon import TelegramClient
           from telethon.sessions import StringSession
@@ -169,11 +399,13 @@ jobs:
           api_hash = os.environ["TELEGRAM_API_HASH"]
           session = os.environ["TELEGRAM_SESSION"]
           target_id = int(os.environ["TELEGRAM_CHAT_ID"])
+          download_type = os.environ["DOWNLOAD_TYPE"]
 
           files = [
               f
               for f in glob.glob("downloads/*")
               if os.path.isfile(f)
+              and not f.endswith(".txt")
           ]
 
           if not files:
@@ -182,18 +414,130 @@ jobs:
               )
 
           file_path = files[0]
-          file_name = os.path.basename(file_path)
-          file_size = os.path.getsize(file_path)
+
+          file_name = os.path.basename(
+              file_path
+          )
+
+          file_size = os.path.getsize(
+              file_path
+          )
 
           print("========================================")
           print("Telegram Upload")
           print("========================================")
 
           print(f"File: {file_name}")
+
           print(
               f"Size: "
               f"{file_size / 1024 / 1024:.2f} MB"
           )
+
+          caption = ""
+
+          if download_type == "video":
+
+              try:
+
+                  video_codec = subprocess.check_output(
+                      [
+                          "ffprobe",
+                          "-v",
+                          "error",
+                          "-select_streams",
+                          "v:0",
+                          "-show_entries",
+                          "stream=codec_name",
+                          "-of",
+                          "default=noprint_wrappers=1:nokey=1",
+                          file_path
+                      ],
+                      text=True
+                  ).strip()
+
+                  audio_codec = subprocess.check_output(
+                      [
+                          "ffprobe",
+                          "-v",
+                          "error",
+                          "-select_streams",
+                          "a:0",
+                          "-show_entries",
+                          "stream=codec_name",
+                          "-of",
+                          "default=noprint_wrappers=1:nokey=1",
+                          file_path
+                      ],
+                      text=True
+                  ).strip()
+
+                  resolution = subprocess.check_output(
+                      [
+                          "ffprobe",
+                          "-v",
+                          "error",
+                          "-select_streams",
+                          "v:0",
+                          "-show_entries",
+                          "stream=width,height",
+                          "-of",
+                          "csv=s=x:p=0",
+                          file_path
+                      ],
+                      text=True
+                  ).strip()
+
+              except Exception:
+
+                  video_codec = "Unknown"
+                  audio_codec = "Unknown"
+                  resolution = "Unknown"
+
+              converted = "Unknown"
+
+              info_file = "video_info.txt"
+
+              if os.path.exists(info_file):
+
+                  with open(
+                      info_file,
+                      "r",
+                      encoding="utf-8"
+                  ) as f:
+
+                      info = f.read()
+
+                  for line in info.splitlines():
+
+                      if line.startswith(
+                          "Converted:"
+                      ):
+
+                          converted = (
+                              line.split(
+                                  ":",
+                                  1
+                              )[1].strip()
+                          )
+
+              caption = (
+                  "🎬 YouTube Video\n\n"
+                  f"📐 Quality: {resolution}\n"
+                  f"🎞 Video: {video_codec}\n"
+                  f"🔊 Audio: {audio_codec}\n"
+                  f"🔄 Converted: {converted}\n"
+                  f"📦 Size: "
+                  f"{file_size / 1024 / 1024:.2f} MB"
+              )
+
+          else:
+
+              caption = (
+                  "🎵 YouTube Audio\n\n"
+                  f"📦 Size: "
+                  f"{file_size / 1024 / 1024:.2f} MB"
+              )
 
           client = TelegramClient(
               StringSession(session),
@@ -204,18 +548,25 @@ jobs:
           async def main():
 
               print()
-              print("Connecting to Telegram...")
+              print(
+                  "Connecting to Telegram..."
+              )
 
               await client.connect()
 
               if not await client.is_user_authorized():
+
                   raise RuntimeError(
                       "Telegram session is not authorized."
                   )
 
-              print("Session authorized.")
+              print(
+                  "Session authorized."
+              )
 
-              print("Searching for target user...")
+              print(
+                  "Searching for target user..."
+              )
 
               target = None
 
@@ -223,30 +574,43 @@ jobs:
 
                   if (
                       dialog.entity
-                      and getattr(
+                      and
+                      getattr(
                           dialog.entity,
                           "id",
                           None
-                      ) == target_id
+                      )
+                      == target_id
                   ):
+
                       target = dialog.entity
                       break
 
               if target is None:
+
                   raise RuntimeError(
-                      f"Target user {target_id} was not found "
+                      f"Target user "
+                      f"{target_id} was not found "
                       "in the uploader account's dialogs."
                   )
 
-              print("Target found.")
+              print(
+                  "Target found."
+              )
 
               print()
-              print("Starting upload...")
+              print(
+                  "Starting upload..."
+              )
 
               start_time = time.time()
+
               last_update = 0
 
-              def progress(current, total):
+              def progress(
+                  current,
+                  total
+              ):
 
                   nonlocal last_update
 
@@ -260,28 +624,39 @@ jobs:
 
                   last_update = now
 
-                  elapsed = now - start_time
+                  elapsed = (
+                      now - start_time
+                  )
 
                   if elapsed <= 0:
                       return
 
-                  percent = current * 100 / total
+                  percent = (
+                      current * 100 / total
+                  )
 
                   speed = (
-                      current / 1024 / 1024
+                      current
+                      / 1024
+                      / 1024
                   ) / elapsed
 
                   uploaded_mb = (
-                      current / 1024 / 1024
+                      current
+                      / 1024
+                      / 1024
                   )
 
                   total_mb = (
-                      total / 1024 / 1024
+                      total
+                      / 1024
+                      / 1024
                   )
 
                   print(
                       f"\r"
-                      f"Upload: {percent:6.2f}% | "
+                      f"Upload: "
+                      f"{percent:6.2f}% | "
                       f"{uploaded_mb:.1f}/"
                       f"{total_mb:.1f} MB | "
                       f"{speed:.2f} MB/s",
@@ -289,30 +664,51 @@ jobs:
                       flush=True
                   )
 
-              await client.send_file(
-                  target,
-                  file_path,
-                  force_document=True,
-                  progress_callback=progress
+              if download_type == "video":
+
+                  await client.send_file(
+                      target,
+                      file_path,
+                      caption=caption,
+                      supports_streaming=True,
+                      force_document=False,
+                      progress_callback=progress
+                  )
+
+              else:
+
+                  await client.send_file(
+                      target,
+                      file_path,
+                      caption=caption,
+                      force_document=False,
+                      progress_callback=progress
+                  )
+
+              elapsed = (
+                  time.time()
+                  - start_time
               )
 
-              elapsed = time.time() - start_time
-
               average_speed = (
-                  file_size / 1024 / 1024
+                  file_size
+                  / 1024
+                  / 1024
               ) / elapsed
 
               print()
               print()
-              print("========================================")
-              print("UPLOAD COMPLETED!")
-              print("========================================")
-
-              print(f"File: {file_name}")
 
               print(
-                  f"Size: "
-                  f"{file_size / 1024 / 1024:.2f} MB"
+                  "========================================"
+              )
+
+              print(
+                  "UPLOAD COMPLETED!"
+              )
+
+              print(
+                  "========================================"
               )
 
               print(
@@ -325,16 +721,25 @@ jobs:
                   f"{elapsed:.1f} seconds"
               )
 
-              print("========================================")
+              print(
+                  "========================================"
+              )
 
               await client.disconnect()
 
           with client:
-              client.loop.run_until_complete(main())
+
+              client.loop.run_until_complete(
+                  main()
+              )
 
           PY
 
           python upload.py
+
+      # ==========================================
+      # CLEANUP
+      # ==========================================
 
       - name: Cleanup
         if: always()
@@ -345,5 +750,6 @@ jobs:
           rm -rf downloads
           rm -f upload.py
           rm -f youtube-cookies.txt
+          rm -f video_info.txt
 
           echo "Cleanup completed."
