@@ -36,9 +36,24 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg nodejs
           python -m pip install --upgrade pip
-          pip install yt-dlp telethon cryptg
+          pip install -U yt-dlp telethon cryptg
+
+      - name: Create YouTube cookies file
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          printf '%s' "$YOUTUBE_COOKIES" > youtube-cookies.txt
+
+          chmod 600 youtube-cookies.txt
+
+          if [ ! -s youtube-cookies.txt ]; then
+            echo "ERROR: YouTube cookies file is empty."
+            exit 1
+          fi
+
+          echo "YouTube cookies loaded successfully."
 
       - name: Download YouTube video
         env:
@@ -62,6 +77,8 @@ jobs:
             echo "Downloading best audio..."
 
             yt-dlp \
+              --cookies youtube-cookies.txt \
+              --js-runtimes node \
               --newline \
               --progress \
               --no-playlist \
@@ -93,6 +110,8 @@ jobs:
             echo "Downloading video + audio..."
 
             yt-dlp \
+              --cookies youtube-cookies.txt \
+              --js-runtimes node \
               --newline \
               --progress \
               --no-playlist \
@@ -324,5 +343,6 @@ jobs:
 
           rm -rf downloads
           rm -f upload.py
+          rm -f youtube-cookies.txt
 
           echo "Cleanup completed."
