@@ -22,9 +22,19 @@ on:
         type: choice
         options:
           - best
+          - 2160
+          - 1440
           - 1080
           - 720
           - 480
+
+      processing_mode:
+        description: "Video processing mode"
+        required: true
+        type: choice
+        options:
+          - original
+          - telegram
 
 jobs:
   youtube-download-upload:
@@ -45,7 +55,7 @@ jobs:
           pip install -U yt-dlp telethon cryptg
 
       # ==========================================
-      # CREATE YOUTUBE COOKIES
+      # YOUTUBE COOKIES
       # ==========================================
 
       - name: Create YouTube cookies file
@@ -60,7 +70,7 @@ jobs:
             exit 1
           fi
 
-          echo "YouTube cookies loaded successfully."
+          echo "YouTube cookies loaded."
 
       # ==========================================
       # DOWNLOAD
@@ -81,10 +91,47 @@ jobs:
 
           echo "Type: $DOWNLOAD_TYPE"
           echo "Quality: $QUALITY"
-          echo ""
 
-          if [ "$DOWNLOAD_TYPE" = "audio" ]; then
+          if [ "$DOWNLOAD_TYPE" = "video" ]; then
 
+            if [ "$QUALITY" = "best" ]; then
+              FORMAT="bestvideo*+bestaudio/best"
+
+            elif [ "$QUALITY" = "2160" ]; then
+              FORMAT="bestvideo[height<=2160]+bestaudio/best[height<=2160]"
+
+            elif [ "$QUALITY" = "1440" ]; then
+              FORMAT="bestvideo[height<=1440]+bestaudio/best[height<=1440]"
+
+            elif [ "$QUALITY" = "1080" ]; then
+              FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+
+            elif [ "$QUALITY" = "720" ]; then
+              FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
+
+            elif [ "$QUALITY" = "480" ]; then
+              FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
+            fi
+
+            echo "Format: $FORMAT"
+            echo ""
+            echo "Downloading video + audio..."
+
+            yt-dlp \
+              --cookies youtube-cookies.txt \
+              --js-runtimes node \
+              --remote-components ejs:github \
+              --newline \
+              --progress \
+              --no-playlist \
+              -f "$FORMAT" \
+              --merge-output-format mp4 \
+              -o "downloads/%(title)s.%(ext)s" \
+              "$YOUTUBE_URL"
+
+          else
+
+            echo ""
             echo "Downloading best audio..."
 
             yt-dlp \
@@ -101,44 +148,10 @@ jobs:
               -o "downloads/%(title)s.%(ext)s" \
               "$YOUTUBE_URL"
 
-          else
-
-            if [ "$QUALITY" = "best" ]; then
-              FORMAT="bestvideo*+bestaudio/best"
-
-            elif [ "$QUALITY" = "1080" ]; then
-              FORMAT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-
-            elif [ "$QUALITY" = "720" ]; then
-              FORMAT="bestvideo[height<=720]+bestaudio/best[height<=720]"
-
-            elif [ "$QUALITY" = "480" ]; then
-              FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
-            fi
-
-            echo "Format: $FORMAT"
-            echo ""
-
-            echo "Downloading video + audio..."
-
-            yt-dlp \
-              --cookies youtube-cookies.txt \
-              --js-runtimes node \
-              --remote-components ejs:github \
-              --newline \
-              --progress \
-              --no-playlist \
-              -f "$FORMAT" \
-              --merge-output-format mp4 \
-              -o "downloads/%(title)s.%(ext)s" \
-              "$YOUTUBE_URL"
-
           fi
 
           echo ""
-          echo "========================================"
-          echo "Download completed!"
-          echo "========================================"
+          echo "Download completed."
 
           ls -lh downloads
 
@@ -146,25 +159,25 @@ jobs:
       # PROCESS VIDEO
       # ==========================================
 
-      - name: Check and optimize video
+      - name: Process video
         if: inputs.download_type == 'video'
+        env:
+          PROCESSING_MODE: ${{ inputs.processing_mode }}
         run: |
 
           FILE=$(find downloads -maxdepth 1 -type f | head -n 1)
 
           if [ -z "$FILE" ]; then
-            echo "ERROR: No downloaded file found."
+            echo "ERROR: No downloaded video found."
             exit 1
           fi
 
           echo "========================================"
-          echo "Checking video"
+          echo "Video Processing"
           echo "========================================"
 
-          echo "File:"
-          echo "$(basename "$FILE")"
-
-          echo ""
+          echo "Mode: $PROCESSING_MODE"
+          echo "File: $(basename "$FILE")"
 
           VIDEO_CODEC=$(ffprobe \
             -v error \
@@ -200,91 +213,99 @@ jobs:
             -of default=noprint_wrappers=1:nokey=1 \
             "$FILE")
 
-          DURATION=$(ffprobe \
-            -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            "$FILE")
-
+          echo ""
+          echo "Original information:"
+          echo "Resolution: ${WIDTH}x${HEIGHT}"
           echo "Video codec: $VIDEO_CODEC"
           echo "Audio codec: $AUDIO_CODEC"
-          echo "Resolution: ${WIDTH}x${HEIGHT}"
           echo "Format: $FORMAT_NAME"
-          echo "Duration: ${DURATION}s"
 
-          NEED_CONVERSION=false
+          CONVERTED="No"
 
-          if [ "$VIDEO_CODEC" != "h264" ]; then
-            NEED_CONVERSION=true
-          fi
+          # ======================================
+          # ORIGINAL CODEC
+          # ======================================
 
-          if [ "$AUDIO_CODEC" != "aac" ]; then
-            NEED_CONVERSION=true
-          fi
-
-          if [[ "$FORMAT_NAME" != *"mp4"* ]]; then
-            NEED_CONVERSION=true
-          fi
-
-          echo ""
-          echo "Conversion required: $NEED_CONVERSION"
-
-          if [ "$NEED_CONVERSION" = "true" ]; then
+          if [ "$PROCESSING_MODE" = "original" ]; then
 
             echo ""
-            echo "========================================"
-            echo "Converting video"
-            echo "========================================"
+            echo "Original Codec mode selected."
+            echo "No video re-encoding will be performed."
 
-            OUTPUT="downloads/converted_video.mp4"
+            FINAL_FILE="$FILE"
 
-            ffmpeg \
-              -y \
-              -i "$FILE" \
-              -map 0:v:0 \
-              -map 0:a:0? \
-              -c:v libx264 \
-              -preset veryfast \
-              -crf 18 \
-              -c:a aac \
-              -b:a 192k \
-              -movflags +faststart \
-              "$OUTPUT"
-
-            rm -f "$FILE"
-
-            mv "$OUTPUT" "downloads/final_video.mp4"
-
-            FILE="downloads/final_video.mp4"
-
-            echo "Conversion completed."
+          # ======================================
+          # TELEGRAM PREVIEW
+          # ======================================
 
           else
 
             echo ""
-            echo "========================================"
-            echo "No conversion required"
-            echo "========================================"
+            echo "Telegram Preview mode selected."
 
-            OUTPUT="downloads/final_video.mp4"
+            NEED_CONVERSION=false
 
-            ffmpeg \
-              -y \
-              -i "$FILE" \
-              -c copy \
-              -movflags +faststart \
-              "$OUTPUT"
+            if [ "$VIDEO_CODEC" != "h264" ]; then
+              NEED_CONVERSION=true
+            fi
 
-            rm -f "$FILE"
+            if [ "$AUDIO_CODEC" != "aac" ]; then
+              NEED_CONVERSION=true
+            fi
 
-            FILE="$OUTPUT"
+            if [[ "$FORMAT_NAME" != *"mp4"* ]]; then
+              NEED_CONVERSION=true
+            fi
 
-            echo "Fast-start optimization completed."
+            if [ "$NEED_CONVERSION" = "true" ]; then
+
+              echo ""
+              echo "Converting to H.264 + AAC..."
+
+              OUTPUT="downloads/telegram_preview.mp4"
+
+              ffmpeg \
+                -y \
+                -i "$FILE" \
+                -map 0:v:0 \
+                -map 0:a:0? \
+                -c:v libx264 \
+                -preset veryfast \
+                -crf 18 \
+                -c:a aac \
+                -b:a 192k \
+                -movflags +faststart \
+                "$OUTPUT"
+
+              rm -f "$FILE"
+
+              FINAL_FILE="$OUTPUT"
+              CONVERTED="Yes"
+
+            else
+
+              echo ""
+              echo "Video already uses compatible codecs."
+
+              OUTPUT="downloads/telegram_preview.mp4"
+
+              ffmpeg \
+                -y \
+                -i "$FILE" \
+                -c copy \
+                -movflags +faststart \
+                "$OUTPUT"
+
+              rm -f "$FILE"
+
+              FINAL_FILE="$OUTPUT"
+
+            fi
 
           fi
 
           # ======================================
-          # FINAL VIDEO INFO
+          # FINAL INFO
           # ======================================
 
           VIDEO_CODEC=$(ffprobe \
@@ -292,39 +313,33 @@ jobs:
             -select_streams v:0 \
             -show_entries stream=codec_name \
             -of default=noprint_wrappers=1:nokey=1 \
-            "$FILE")
+            "$FINAL_FILE")
 
           AUDIO_CODEC=$(ffprobe \
             -v error \
             -select_streams a:0 \
             -show_entries stream=codec_name \
             -of default=noprint_wrappers=1:nokey=1 \
-            "$FILE")
+            "$FINAL_FILE")
 
           WIDTH=$(ffprobe \
             -v error \
             -select_streams v:0 \
             -show_entries stream=width \
             -of default=noprint_wrappers=1:nokey=1 \
-            "$FILE")
+            "$FINAL_FILE")
 
           HEIGHT=$(ffprobe \
             -v error \
             -select_streams v:0 \
             -show_entries stream=height \
             -of default=noprint_wrappers=1:nokey=1 \
-            "$FILE")
+            "$FINAL_FILE")
 
-          FILE_SIZE=$(stat -c%s "$FILE")
+          FILE_SIZE=$(stat -c%s "$FINAL_FILE")
 
           FILE_SIZE_MB=$(awk \
             "BEGIN {printf \"%.2f\", $FILE_SIZE/1024/1024}")
-
-          if [ "$NEED_CONVERSION" = "true" ]; then
-            CONVERTED="Yes"
-          else
-            CONVERTED="No"
-          fi
 
           echo ""
           echo "========================================"
@@ -334,30 +349,30 @@ jobs:
           echo "Resolution: ${WIDTH}x${HEIGHT}"
           echo "Video codec: $VIDEO_CODEC"
           echo "Audio codec: $AUDIO_CODEC"
+          echo "Processing mode: $PROCESSING_MODE"
           echo "Converted: $CONVERTED"
           echo "Size: ${FILE_SIZE_MB} MB"
-
-          echo ""
 
           cat > video_info.txt <<EOF
           Resolution: ${WIDTH}x${HEIGHT}
           Video codec: ${VIDEO_CODEC}
           Audio codec: ${AUDIO_CODEC}
+          Processing mode: ${PROCESSING_MODE}
           Converted: ${CONVERTED}
           Size: ${FILE_SIZE_MB} MB
           EOF
 
       # ==========================================
-      # FIND FILE
+      # FIND FINAL FILE
       # ==========================================
 
-      - name: Find downloaded file
+      - name: Find final file
         run: |
 
           FILE=$(find downloads -maxdepth 1 -type f | head -n 1)
 
           if [ -z "$FILE" ]; then
-            echo "ERROR: No downloaded file found."
+            echo "ERROR: No final file found."
             exit 1
           fi
 
@@ -366,13 +381,11 @@ jobs:
           echo "========================================"
 
           echo "File: $(basename "$FILE")"
-
-          echo ""
           echo "Size:"
           du -h "$FILE"
 
       # ==========================================
-      # UPLOAD TO TELEGRAM
+      # TELEGRAM UPLOAD
       # ==========================================
 
       - name: Upload to Telegram
@@ -423,85 +436,56 @@ jobs:
               file_path
           )
 
-          print("========================================")
-          print("Telegram Upload")
-          print("========================================")
-
-          print(f"File: {file_name}")
-
-          print(
-              f"Size: "
-              f"{file_size / 1024 / 1024:.2f} MB"
-          )
-
           caption = ""
 
           if download_type == "video":
 
-              try:
+              def get_probe(args):
+                  try:
+                      return subprocess.check_output(
+                          args,
+                          text=True
+                      ).strip()
+                  except Exception:
+                      return "Unknown"
 
-                  video_codec = subprocess.check_output(
-                      [
-                          "ffprobe",
-                          "-v",
-                          "error",
-                          "-select_streams",
-                          "v:0",
-                          "-show_entries",
-                          "stream=codec_name",
-                          "-of",
-                          "default=noprint_wrappers=1:nokey=1",
-                          file_path
-                      ],
-                      text=True
-                  ).strip()
+              video_codec = get_probe([
+                  "ffprobe",
+                  "-v", "error",
+                  "-select_streams", "v:0",
+                  "-show_entries", "stream=codec_name",
+                  "-of",
+                  "default=noprint_wrappers=1:nokey=1",
+                  file_path
+              ])
 
-                  audio_codec = subprocess.check_output(
-                      [
-                          "ffprobe",
-                          "-v",
-                          "error",
-                          "-select_streams",
-                          "a:0",
-                          "-show_entries",
-                          "stream=codec_name",
-                          "-of",
-                          "default=noprint_wrappers=1:nokey=1",
-                          file_path
-                      ],
-                      text=True
-                  ).strip()
+              audio_codec = get_probe([
+                  "ffprobe",
+                  "-v", "error",
+                  "-select_streams", "a:0",
+                  "-show_entries", "stream=codec_name",
+                  "-of",
+                  "default=noprint_wrappers=1:nokey=1",
+                  file_path
+              ])
 
-                  resolution = subprocess.check_output(
-                      [
-                          "ffprobe",
-                          "-v",
-                          "error",
-                          "-select_streams",
-                          "v:0",
-                          "-show_entries",
-                          "stream=width,height",
-                          "-of",
-                          "csv=s=x:p=0",
-                          file_path
-                      ],
-                      text=True
-                  ).strip()
+              resolution = get_probe([
+                  "ffprobe",
+                  "-v", "error",
+                  "-select_streams", "v:0",
+                  "-show_entries",
+                  "stream=width,height",
+                  "-of", "csv=s=x:p=0",
+                  file_path
+              ])
 
-              except Exception:
-
-                  video_codec = "Unknown"
-                  audio_codec = "Unknown"
-                  resolution = "Unknown"
-
+              processing_mode = "Unknown"
               converted = "Unknown"
 
-              info_file = "video_info.txt"
-
-              if os.path.exists(info_file):
+              if os.path.exists("video_info.txt"):
 
                   with open(
-                      info_file,
+                      "video_info.txt",
                       "r",
                       encoding="utf-8"
                   ) as f:
@@ -511,9 +495,18 @@ jobs:
                   for line in info.splitlines():
 
                       if line.startswith(
+                          "Processing mode:"
+                      ):
+                          processing_mode = (
+                              line.split(
+                                  ":",
+                                  1
+                              )[1].strip()
+                          )
+
+                      elif line.startswith(
                           "Converted:"
                       ):
-
                           converted = (
                               line.split(
                                   ":",
@@ -526,6 +519,7 @@ jobs:
                   f"📐 Quality: {resolution}\n"
                   f"🎞 Video: {video_codec}\n"
                   f"🔊 Audio: {audio_codec}\n"
+                  f"⚙️ Mode: {processing_mode}\n"
                   f"🔄 Converted: {converted}\n"
                   f"📦 Size: "
                   f"{file_size / 1024 / 1024:.2f} MB"
@@ -547,7 +541,6 @@ jobs:
 
           async def main():
 
-              print()
               print(
                   "Connecting to Telegram..."
               )
@@ -564,10 +557,6 @@ jobs:
                   "Session authorized."
               )
 
-              print(
-                  "Searching for target user..."
-              )
-
               target = None
 
               async for dialog in client.iter_dialogs():
@@ -579,8 +568,7 @@ jobs:
                           dialog.entity,
                           "id",
                           None
-                      )
-                      == target_id
+                      ) == target_id
                   ):
 
                       target = dialog.entity
@@ -590,21 +578,18 @@ jobs:
 
                   raise RuntimeError(
                       f"Target user "
-                      f"{target_id} was not found "
-                      "in the uploader account's dialogs."
+                      f"{target_id} was not found."
                   )
 
               print(
                   "Target found."
               )
 
-              print()
               print(
                   "Starting upload..."
               )
 
               start_time = time.time()
-
               last_update = 0
 
               def progress(
@@ -641,24 +626,9 @@ jobs:
                       / 1024
                   ) / elapsed
 
-                  uploaded_mb = (
-                      current
-                      / 1024
-                      / 1024
-                  )
-
-                  total_mb = (
-                      total
-                      / 1024
-                      / 1024
-                  )
-
                   print(
-                      f"\r"
-                      f"Upload: "
+                      f"\rUpload: "
                       f"{percent:6.2f}% | "
-                      f"{uploaded_mb:.1f}/"
-                      f"{total_mb:.1f} MB | "
                       f"{speed:.2f} MB/s",
                       end="",
                       flush=True
@@ -670,8 +640,8 @@ jobs:
                       target,
                       file_path,
                       caption=caption,
-                      supports_streaming=True,
                       force_document=False,
+                      supports_streaming=True,
                       progress_callback=progress
                   )
 
@@ -698,7 +668,6 @@ jobs:
 
               print()
               print()
-
               print(
                   "========================================"
               )
@@ -708,11 +677,7 @@ jobs:
               )
 
               print(
-                  "========================================"
-              )
-
-              print(
-                  f"Average upload speed: "
+                  f"Average speed: "
                   f"{average_speed:.2f} MB/s"
               )
 
