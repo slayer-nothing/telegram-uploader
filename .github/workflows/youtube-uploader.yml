@@ -92,6 +92,41 @@ jobs:
           echo "Type: $DOWNLOAD_TYPE"
           echo "Quality: $QUALITY"
 
+          # --------------------------------------
+          # GET VIDEO INFORMATION
+          # --------------------------------------
+
+          echo ""
+          echo "Getting video information..."
+
+          yt-dlp \
+            --cookies youtube-cookies.txt \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --no-playlist \
+            --print "%(title)s" \
+            --print "%(webpage_url)s" \
+            --skip-download \
+            "$YOUTUBE_URL" > youtube_info_raw.txt
+
+          TITLE=$(sed -n '1p' youtube_info_raw.txt)
+          VIDEO_URL=$(sed -n '2p' youtube_info_raw.txt)
+
+          echo ""
+          echo "Title:"
+          echo "$TITLE"
+
+          echo ""
+          echo "URL:"
+          echo "$VIDEO_URL"
+
+          printf '%s' "$TITLE" > youtube_title.txt
+          printf '%s' "$VIDEO_URL" > youtube_url.txt
+
+          # --------------------------------------
+          # DOWNLOAD VIDEO
+          # --------------------------------------
+
           if [ "$DOWNLOAD_TYPE" = "video" ]; then
 
             if [ "$QUALITY" = "best" ]; then
@@ -113,6 +148,7 @@ jobs:
               FORMAT="bestvideo[height<=480]+bestaudio/best[height<=480]"
             fi
 
+            echo ""
             echo "Format: $FORMAT"
             echo ""
             echo "Downloading video + audio..."
@@ -128,6 +164,10 @@ jobs:
               --merge-output-format mp4 \
               -o "downloads/%(title)s.%(ext)s" \
               "$YOUTUBE_URL"
+
+          # --------------------------------------
+          # DOWNLOAD AUDIO
+          # --------------------------------------
 
           else
 
@@ -207,6 +247,13 @@ jobs:
             -of default=noprint_wrappers=1:nokey=1 \
             "$FILE")
 
+          FPS=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=r_frame_rate \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FILE")
+
           FORMAT_NAME=$(ffprobe \
             -v error \
             -show_entries format=format_name \
@@ -216,6 +263,7 @@ jobs:
           echo ""
           echo "Original information:"
           echo "Resolution: ${WIDTH}x${HEIGHT}"
+          echo "FPS: $FPS"
           echo "Video codec: $VIDEO_CODEC"
           echo "Audio codec: $AUDIO_CODEC"
           echo "Format: $FORMAT_NAME"
@@ -230,7 +278,7 @@ jobs:
 
             echo ""
             echo "Original Codec mode selected."
-            echo "No video re-encoding will be performed."
+            echo "No video re-encoding."
 
             FINAL_FILE="$FILE"
 
@@ -285,7 +333,7 @@ jobs:
             else
 
               echo ""
-              echo "Video already uses compatible codecs."
+              echo "Compatible codecs detected."
 
               OUTPUT="downloads/telegram_preview.mp4"
 
@@ -305,7 +353,7 @@ jobs:
           fi
 
           # ======================================
-          # FINAL INFO
+          # FINAL VIDEO INFO
           # ======================================
 
           VIDEO_CODEC=$(ffprobe \
@@ -336,6 +384,13 @@ jobs:
             -of default=noprint_wrappers=1:nokey=1 \
             "$FINAL_FILE")
 
+          FPS=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=r_frame_rate \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$FINAL_FILE")
+
           FILE_SIZE=$(stat -c%s "$FINAL_FILE")
 
           FILE_SIZE_MB=$(awk \
@@ -347,6 +402,7 @@ jobs:
           echo "========================================"
 
           echo "Resolution: ${WIDTH}x${HEIGHT}"
+          echo "FPS: $FPS"
           echo "Video codec: $VIDEO_CODEC"
           echo "Audio codec: $AUDIO_CODEC"
           echo "Processing mode: $PROCESSING_MODE"
@@ -355,6 +411,7 @@ jobs:
 
           cat > video_info.txt <<EOF
           Resolution: ${WIDTH}x${HEIGHT}
+          FPS: ${FPS}
           Video codec: ${VIDEO_CODEC}
           Audio codec: ${AUDIO_CODEC}
           Processing mode: ${PROCESSING_MODE}
@@ -363,7 +420,7 @@ jobs:
           EOF
 
       # ==========================================
-      # FIND FINAL FILE
+      # FINAL FILE
       # ==========================================
 
       - name: Find final file
@@ -381,11 +438,13 @@ jobs:
           echo "========================================"
 
           echo "File: $(basename "$FILE")"
+
+          echo ""
           echo "Size:"
           du -h "$FILE"
 
       # ==========================================
-      # TELEGRAM UPLOAD
+      # UPLOAD TO TELEGRAM
       # ==========================================
 
       - name: Upload to Telegram
@@ -436,24 +495,60 @@ jobs:
               file_path
           )
 
+          # ======================================
+          # YOUTUBE INFO
+          # ======================================
+
+          title = "Unknown Title"
+          video_url = "Unknown URL"
+
+          if os.path.exists("youtube_title.txt"):
+
+              with open(
+                  "youtube_title.txt",
+                  "r",
+                  encoding="utf-8"
+              ) as f:
+
+                  title = f.read().strip()
+
+          if os.path.exists("youtube_url.txt"):
+
+              with open(
+                  "youtube_url.txt",
+                  "r",
+                  encoding="utf-8"
+              ) as f:
+
+                  video_url = f.read().strip()
+
+          # ======================================
+          # CAPTION
+          # ======================================
+
           caption = ""
 
           if download_type == "video":
 
               def get_probe(args):
+
                   try:
+
                       return subprocess.check_output(
                           args,
                           text=True
                       ).strip()
+
                   except Exception:
+
                       return "Unknown"
 
               video_codec = get_probe([
                   "ffprobe",
                   "-v", "error",
                   "-select_streams", "v:0",
-                  "-show_entries", "stream=codec_name",
+                  "-show_entries",
+                  "stream=codec_name",
                   "-of",
                   "default=noprint_wrappers=1:nokey=1",
                   file_path
@@ -463,7 +558,8 @@ jobs:
                   "ffprobe",
                   "-v", "error",
                   "-select_streams", "a:0",
-                  "-show_entries", "stream=codec_name",
+                  "-show_entries",
+                  "stream=codec_name",
                   "-of",
                   "default=noprint_wrappers=1:nokey=1",
                   file_path
@@ -475,14 +571,28 @@ jobs:
                   "-select_streams", "v:0",
                   "-show_entries",
                   "stream=width,height",
-                  "-of", "csv=s=x:p=0",
+                  "-of",
+                  "csv=s=x:p=0",
+                  file_path
+              ])
+
+              fps = get_probe([
+                  "ffprobe",
+                  "-v", "error",
+                  "-select_streams", "v:0",
+                  "-show_entries",
+                  "stream=r_frame_rate",
+                  "-of",
+                  "default=noprint_wrappers=1:nokey=1",
                   file_path
               ])
 
               processing_mode = "Unknown"
               converted = "Unknown"
 
-              if os.path.exists("video_info.txt"):
+              if os.path.exists(
+                  "video_info.txt"
+              ):
 
                   with open(
                       "video_info.txt",
@@ -497,6 +607,7 @@ jobs:
                       if line.startswith(
                           "Processing mode:"
                       ):
+
                           processing_mode = (
                               line.split(
                                   ":",
@@ -507,6 +618,7 @@ jobs:
                       elif line.startswith(
                           "Converted:"
                       ):
+
                           converted = (
                               line.split(
                                   ":",
@@ -516,9 +628,17 @@ jobs:
 
               caption = (
                   "🎬 YouTube Video\n\n"
+
+                  f"📝 Title:\n"
+                  f"{title}\n\n"
+
+                  f"🔗 Source:\n"
+                  f"{video_url}\n\n"
+
                   f"📐 Quality: {resolution}\n"
                   f"🎞 Video: {video_codec}\n"
                   f"🔊 Audio: {audio_codec}\n"
+                  f"🎞 FPS: {fps}\n"
                   f"⚙️ Mode: {processing_mode}\n"
                   f"🔄 Converted: {converted}\n"
                   f"📦 Size: "
@@ -529,9 +649,20 @@ jobs:
 
               caption = (
                   "🎵 YouTube Audio\n\n"
+
+                  f"📝 Title:\n"
+                  f"{title}\n\n"
+
+                  f"🔗 Source:\n"
+                  f"{video_url}\n\n"
+
                   f"📦 Size: "
                   f"{file_size / 1024 / 1024:.2f} MB"
               )
+
+          # ======================================
+          # TELEGRAM
+          # ======================================
 
           client = TelegramClient(
               StringSession(session),
@@ -590,6 +721,7 @@ jobs:
               )
 
               start_time = time.time()
+
               last_update = 0
 
               def progress(
@@ -605,6 +737,7 @@ jobs:
                       now - last_update < 1
                       and current < total
                   ):
+
                       return
 
                   last_update = now
@@ -614,6 +747,7 @@ jobs:
                   )
 
                   if elapsed <= 0:
+
                       return
 
                   percent = (
@@ -668,6 +802,7 @@ jobs:
 
               print()
               print()
+
               print(
                   "========================================"
               )
@@ -715,6 +850,9 @@ jobs:
           rm -rf downloads
           rm -f upload.py
           rm -f youtube-cookies.txt
+          rm -f youtube_info_raw.txt
+          rm -f youtube_title.txt
+          rm -f youtube_url.txt
           rm -f video_info.txt
 
           echo "Cleanup completed."
