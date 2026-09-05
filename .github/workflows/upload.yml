@@ -1,3 +1,4 @@
+```yaml
 name: Telegram File Uploader
 
 on:
@@ -14,6 +15,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -22,7 +24,7 @@ jobs:
           pip install telethon cryptg
 
       # ========================================
-      # TEST SERVER RESPONSE
+      # TEST URL WITH CHROME-LIKE REQUEST
       # ========================================
 
       - name: Test download URL
@@ -44,7 +46,7 @@ jobs:
 
           curl -IL \
             --max-time 30 \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36" \
             --referer "https://soft98.ir/" \
             "$FILE_URL" || true
 
@@ -56,7 +58,7 @@ jobs:
           curl -L \
             --max-time 30 \
             --range 0-1023 \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36" \
             --referer "https://soft98.ir/" \
             -o /tmp/url_test \
             -w "HTTP Status: %{http_code}\nContent-Type: %{content_type}\nContent-Length: %{size_download} bytes\nFinal URL: %{url_effective}\n" \
@@ -66,7 +68,45 @@ jobs:
           echo "Test completed."
 
       # ========================================
-      # DOWNLOAD
+      # CHROME-LIKE FULL DOWNLOAD TEST
+      # ========================================
+
+      - name: Test full download with curl
+        env:
+          FILE_URL: ${{ inputs.url }}
+        run: |
+          echo "========================================"
+          echo "Testing full download with curl..."
+          echo "========================================"
+
+          rm -f /tmp/test.zip
+
+          curl -L \
+            --fail \
+            --retry 3 \
+            --retry-delay 3 \
+            --connect-timeout 15 \
+            --max-time 600 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" \
+            -H "Accept-Language: en-US,en;q=0.9,fa;q=0.8" \
+            -H "Sec-Fetch-Dest: document" \
+            -H "Sec-Fetch-Mode: navigate" \
+            -H "Sec-Fetch-Site: none" \
+            -H "Sec-Fetch-User: ?1" \
+            -H "Upgrade-Insecure-Requests: 1" \
+            -o /tmp/test.zip \
+            "$FILE_URL"
+
+          echo ""
+          echo "========================================"
+          echo "CURL DOWNLOAD SUCCESSFUL!"
+          echo "========================================"
+
+          ls -lh /tmp/test.zip
+
+      # ========================================
+      # ARIA2 DOWNLOAD
       # ========================================
 
       - name: Download file
@@ -75,17 +115,11 @@ jobs:
         run: |
           mkdir -p downloads
 
-          echo ""
           echo "========================================"
-          echo "Starting download..."
+          echo "Starting aria2 download..."
           echo "========================================"
 
-          echo ""
-          echo "Trying multi-connection download..."
-          echo "Connections: 8"
-          echo ""
-
-          if aria2c \
+          aria2c \
             --dir=downloads \
             --continue=true \
             --auto-file-renaming=false \
@@ -96,60 +130,13 @@ jobs:
             --min-split-size=10M \
             --max-tries=10 \
             --retry-wait=3 \
-            --connect-timeout=15 \
+            --connect-timeout=10 \
             --timeout=60 \
             --download-result=full \
             --summary-interval=5 \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36" \
             --referer="https://soft98.ir/" \
             "$FILE_URL"
-          then
-
-            echo ""
-            echo "========================================"
-            echo "Multi-connection download succeeded!"
-            echo "========================================"
-
-          else
-
-            echo ""
-            echo "========================================"
-            echo "Multi-connection download failed!"
-            echo "Falling back to single connection..."
-            echo "========================================"
-
-            rm -rf downloads/*
-            mkdir -p downloads
-
-            echo ""
-            echo "Trying single-connection download..."
-            echo "Connections: 1"
-            echo ""
-
-            aria2c \
-              --dir=downloads \
-              --continue=true \
-              --auto-file-renaming=false \
-              --allow-overwrite=true \
-              --file-allocation=none \
-              --split=1 \
-              --max-connection-per-server=1 \
-              --max-tries=10 \
-              --retry-wait=3 \
-              --connect-timeout=15 \
-              --timeout=60 \
-              --download-result=full \
-              --summary-interval=5 \
-              --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
-              --referer="https://soft98.ir/" \
-              "$FILE_URL"
-
-            echo ""
-            echo "========================================"
-            echo "Single-connection download succeeded!"
-            echo "========================================"
-
-          fi
 
           echo ""
           echo "========================================"
@@ -171,15 +158,12 @@ jobs:
             exit 1
           fi
 
-          echo "========================================"
-          echo "Downloaded file"
-          echo "========================================"
           echo "File: $(basename "$FILE")"
           echo "Size:"
           du -h "$FILE"
 
       # ========================================
-      # TELEGRAM UPLOAD
+      # UPLOAD TO TELEGRAM
       # ========================================
 
       - name: Upload to Telegram
@@ -372,4 +356,7 @@ jobs:
           echo "Cleaning temporary files..."
           rm -rf downloads
           rm -f upload.py
+          rm -f /tmp/test.zip
+          rm -f /tmp/url_test
           echo "Cleanup completed."
+```
