@@ -31,7 +31,12 @@ jobs:
           echo "Starting download..."
           echo "========================================"
 
-          aria2c \
+          echo ""
+          echo "Trying multi-connection download..."
+          echo "Connections: 8"
+          echo ""
+
+          if aria2c \
             --dir=downloads \
             --continue=true \
             --auto-file-renaming=false \
@@ -42,11 +47,61 @@ jobs:
             --min-split-size=10M \
             --max-tries=10 \
             --retry-wait=3 \
-            --connect-timeout=10 \
+            --connect-timeout=15 \
             --timeout=60 \
             --download-result=full \
             --summary-interval=5 \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+            --referer="https://soft98.ir/" \
             "$FILE_URL"
+          then
+
+            echo ""
+            echo "========================================"
+            echo "Multi-connection download succeeded!"
+            echo "========================================"
+
+          else
+
+            echo ""
+            echo "========================================"
+            echo "Multi-connection download failed!"
+            echo "Falling back to single connection..."
+            echo "========================================"
+
+            rm -rf downloads/*
+            mkdir -p downloads
+
+            echo ""
+            echo "Trying single-connection download..."
+            echo "Connections: 1"
+            echo ""
+
+            aria2c \
+              --dir=downloads \
+              --continue=true \
+              --auto-file-renaming=false \
+              --allow-overwrite=true \
+              --file-allocation=none \
+              --split=1 \
+              --max-connection-per-server=1 \
+              --min-split-size=10M \
+              --max-tries=10 \
+              --retry-wait=3 \
+              --connect-timeout=15 \
+              --timeout=60 \
+              --download-result=full \
+              --summary-interval=5 \
+              --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+              --referer="https://soft98.ir/" \
+              "$FILE_URL"
+
+            echo ""
+            echo "========================================"
+            echo "Single-connection download succeeded!"
+            echo "========================================"
+
+          fi
 
           echo ""
           echo "========================================"
