@@ -17,9 +17,57 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y aria2 curl
           python -m pip install --upgrade pip
           pip install telethon cryptg
+
+      # ========================================
+      # TEST SERVER RESPONSE
+      # ========================================
+
+      - name: Test download URL
+        env:
+          FILE_URL: ${{ inputs.url }}
+        run: |
+          echo "========================================"
+          echo "Testing download URL..."
+          echo "========================================"
+
+          echo ""
+          echo "URL:"
+          echo "$FILE_URL"
+          echo ""
+
+          echo "========================================"
+          echo "HTTP RESPONSE"
+          echo "========================================"
+
+          curl -IL \
+            --max-time 30 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+            --referer "https://soft98.ir/" \
+            "$FILE_URL" || true
+
+          echo ""
+          echo "========================================"
+          echo "BODY TEST"
+          echo "========================================"
+
+          curl -L \
+            --max-time 30 \
+            --range 0-1023 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36" \
+            --referer "https://soft98.ir/" \
+            -o /tmp/url_test \
+            -w "HTTP Status: %{http_code}\nContent-Type: %{content_type}\nContent-Length: %{size_download} bytes\nFinal URL: %{url_effective}\n" \
+            "$FILE_URL" || true
+
+          echo ""
+          echo "Test completed."
+
+      # ========================================
+      # DOWNLOAD
+      # ========================================
 
       - name: Download file
         env:
@@ -27,6 +75,7 @@ jobs:
         run: |
           mkdir -p downloads
 
+          echo ""
           echo "========================================"
           echo "Starting download..."
           echo "========================================"
@@ -85,7 +134,6 @@ jobs:
               --file-allocation=none \
               --split=1 \
               --max-connection-per-server=1 \
-              --min-split-size=10M \
               --max-tries=10 \
               --retry-wait=3 \
               --connect-timeout=15 \
@@ -110,6 +158,10 @@ jobs:
 
           ls -lh downloads
 
+      # ========================================
+      # SHOW FILE
+      # ========================================
+
       - name: Show downloaded file
         run: |
           FILE=$(find downloads -maxdepth 1 -type f | head -n 1)
@@ -119,9 +171,16 @@ jobs:
             exit 1
           fi
 
+          echo "========================================"
+          echo "Downloaded file"
+          echo "========================================"
           echo "File: $(basename "$FILE")"
           echo "Size:"
           du -h "$FILE"
+
+      # ========================================
+      # TELEGRAM UPLOAD
+      # ========================================
 
       - name: Upload to Telegram
         env:
@@ -295,9 +354,17 @@ jobs:
 
           python upload.py
 
+      # ========================================
+      # VERIFY
+      # ========================================
+
       - name: Verify upload step
         run: |
           echo "Telegram upload step completed successfully."
+
+      # ========================================
+      # CLEANUP
+      # ========================================
 
       - name: Cleanup
         if: always()
