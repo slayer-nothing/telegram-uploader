@@ -1,4 +1,3 @@
-```yaml
 name: Telegram Temporary Stream
 
 on:
@@ -16,9 +15,6 @@ jobs:
 
     steps:
 
-      # =========================
-      # Install dependencies
-      # =========================
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -26,9 +22,6 @@ jobs:
 
           pip install telethon cryptg fastapi uvicorn
 
-      # =========================
-      # Install Cloudflare Tunnel
-      # =========================
       - name: Install cloudflared
         run: |
           curl -L \
@@ -38,9 +31,6 @@ jobs:
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
 
-      # =========================
-      # Download Telegram video
-      # =========================
       - name: Download Telegram media
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -109,14 +99,13 @@ jobs:
 
               print("Media found.")
 
-              # Get original filename if Telegram provides one
-              original_name = None
+              filename = None
 
               if message.file:
 
                   if message.file.name:
-                      original_name = message.file.name
-                      print(f"Original filename: {original_name}")
+                      filename = message.file.name
+                      print(f"Original filename: {filename}")
 
                   if message.file.size:
                       print(
@@ -124,19 +113,17 @@ jobs:
                           f"{message.file.size / 1024 / 1024:.2f} MB"
                       )
 
-              # Fallback filename
-              if not original_name:
-                  original_name = "telegram_media"
+              if not filename:
+                  filename = "telegram_media"
 
-              # Prevent path traversal
-              original_name = os.path.basename(original_name)
+              filename = os.path.basename(filename)
 
-              print(f"Saving as: {original_name}")
+              print(f"Saving as: {filename}")
               print("Downloading...")
 
               downloaded = await client.download_media(
                   message,
-                  file=original_name
+                  file=filename
               )
 
               if not downloaded:
@@ -156,9 +143,6 @@ jobs:
           echo "Downloaded files:"
           ls -lah
 
-      # =========================
-      # Detect downloaded media
-      # =========================
       - name: Detect media file
         run: |
 
@@ -187,9 +171,6 @@ jobs:
           echo "File size:"
           ls -lh "$MEDIA_FILE"
 
-      # =========================
-      # Create streaming server
-      # =========================
       - name: Create streaming server
         run: |
 
@@ -228,10 +209,6 @@ jobs:
 
               range_header = request.headers.get("range")
 
-              # =========================
-              # Full file request
-              # =========================
-
               if not range_header:
 
                   def full_file():
@@ -258,16 +235,13 @@ jobs:
                   )
 
 
-              # =========================
-              # HTTP Range request
-              # =========================
-
               if not range_header.startswith("bytes="):
 
                   return Response(
                       status_code=416,
                       headers={
-                          "Content-Range": f"bytes */{file_size}"
+                          "Content-Range":
+                              f"bytes */{file_size}"
                       }
                   )
 
@@ -278,10 +252,10 @@ jobs:
                   1
               )
 
-              # Handle only one range
               range_value = range_value.split(",")[0]
 
               start_str, end_str = range_value.split("-")
+
 
               if start_str:
 
@@ -294,7 +268,6 @@ jobs:
 
               else:
 
-                  # bytes=-500000
                   suffix_length = int(end_str)
 
                   if suffix_length <= 0:
@@ -396,13 +369,6 @@ jobs:
 
           echo "Server started."
 
-          echo ""
-          echo "Server status:"
-          curl -I http://127.0.0.1:8080/media || true
-
-      # =========================
-      # Start Cloudflare Tunnel
-      # =========================
       - name: Start Cloudflare Tunnel
         run: |
 
@@ -430,22 +396,17 @@ jobs:
 
           done
 
-
           if [ -z "$URL" ]; then
 
             echo "Could not get Cloudflare URL."
 
-            echo ""
-            echo "Cloudflare log:"
             cat cloudflared.log
 
             exit 1
 
           fi
 
-
           STREAM_URL="${URL}/media"
-
 
           echo ""
           echo "=========================================="
@@ -455,28 +416,16 @@ jobs:
           echo "File:"
           echo "$MEDIA_FILE"
           echo ""
-          echo "MIME:"
-          file --mime-type "$MEDIA_FILE"
-          echo ""
           echo "Stream URL:"
-          echo "$STREAM_URL"
-          echo ""
-          echo "Browser:"
           echo "$STREAM_URL"
           echo ""
           echo "VLC:"
           echo "$STREAM_URL"
           echo ""
           echo "=========================================="
-          echo "The link is active while this job is running."
-          echo "=========================================="
-          echo ""
 
           echo "STREAM_URL=$STREAM_URL" >> "$GITHUB_ENV"
 
-      # =========================
-      # Keep stream alive
-      # =========================
       - name: Keep stream alive
         run: |
 
@@ -493,4 +442,3 @@ jobs:
             sleep 60
 
           done
-```
