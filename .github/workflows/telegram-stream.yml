@@ -11,42 +11,37 @@ on:
 jobs:
   stream:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
 
-      # ========================================
-      # INSTALL
-      # ========================================
-
-      - name: Install dependencies
+      # =========================
+      # Install dependencies
+      # =========================
+      - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl python3-pip
 
-          python3 -m pip install --upgrade pip
+      - name: Install Python packages
+        run: |
           pip install telethon cryptg fastapi uvicorn
 
-      # ========================================
-      # INSTALL CLOUDFLARED
-      # ========================================
-
-      - name: Install Cloudflare Tunnel
+      # =========================
+      # Install Cloudflare Tunnel
+      # =========================
+      - name: Install cloudflared
         run: |
           curl -L \
-            -o cloudflared \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
 
           chmod +x cloudflared
-
           sudo mv cloudflared /usr/local/bin/cloudflared
 
-          cloudflared --version
-
-      # ========================================
-      # DOWNLOAD TELEGRAM VIDEO
-      # ========================================
-
+      # =========================
+      # Download Telegram video
+      # =========================
       - name: Download Telegram video
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -56,7 +51,6 @@ jobs:
         run: |
 
           cat > download.py <<'PY'
-
           import os
           import re
           import asyncio
@@ -65,251 +59,262 @@ jobs:
           from telethon.sessions import StringSession
 
 
-          api_id = int(os.environ["TELEGRAM_API_ID"])
-          api_hash = os.environ["TELEGRAM_API_HASH"]
-          session = os.environ["TELEGRAM_SESSION"]
-          url = os.environ["TELEGRAM_URL"]
+          API_ID = int(os.environ["TELEGRAM_API_ID"])
+          API_HASH = os.environ["TELEGRAM_API_HASH"]
+          SESSION = os.environ["TELEGRAM_SESSION"]
+          URL = os.environ["TELEGRAM_URL"]
 
 
-          def parse_telegram_url(url):
+          def parse_url(url):
 
-              match = re.search(
-                  r"https?://t\.me/(?:s/)?([^/]+)/(\d+)",
+              m = re.search(
+                  r"https?://t\.me/(?:s/)?([^/?#]+)/(\d+)",
                   url
               )
 
-              if not match:
+              if not m:
                   raise ValueError(
-                      "Invalid Telegram public message URL."
+                      "Invalid Telegram message URL"
                   )
 
-              username = match.group(1)
-              message_id = int(match.group(2))
+              username = m.group(1)
+              message_id = int(m.group(2))
 
               return username, message_id
 
 
           async def main():
 
-              username, message_id = parse_telegram_url(url)
+              username, message_id = parse_url(URL)
 
-              print("========================================")
-              print("Telegram Stream")
-              print("========================================")
-              print(f"Channel/Group: {username}")
+              print(f"Telegram: @{username}")
               print(f"Message ID: {message_id}")
-              print()
 
               client = TelegramClient(
-                  StringSession(session),
-                  api_id,
-                  api_hash
+                  StringSession(SESSION),
+                  API_ID,
+                  API_HASH
               )
 
-              await client.connect()
-
-              if not await client.is_user_authorized():
-                  raise RuntimeError(
-                      "Telegram session is not authorized."
-                  )
-
-              print("Telegram session authorized.")
-              print("Finding message...")
-
-              entity = await client.get_entity(username)
+              await client.start()
 
               message = await client.get_messages(
-                  entity,
+                  username,
                   ids=message_id
               )
 
               if not message:
                   raise RuntimeError(
-                      "Telegram message not found."
+                      "Telegram message not found"
                   )
 
               if not message.media:
                   raise RuntimeError(
-                      "This message does not contain media."
+                      "This message has no media"
                   )
 
-              if not message.video and not message.document:
-                  raise RuntimeError(
-                      "This message does not appear to contain a video."
-                  )
+              print("Media found.")
 
-              print("Video found.")
+              file_name = "telegram_original"
 
               if message.file:
-                  print(
-                      f"File name: "
-                      f"{message.file.name or 'unknown'}"
-                  )
+                  if message.file.name:
+                      print(
+                          f"Original filename: {message.file.name}"
+                      )
 
                   if message.file.size:
                       print(
-                          f"File size: "
+                          f"Telegram file size: "
                           f"{message.file.size / 1024 / 1024:.2f} MB"
                       )
 
-              print()
-              print("Downloading video from Telegram...")
-              print()
+              print("Downloading...")
 
               await client.download_media(
                   message,
-                  file="telegram_video"
+                  file=file_name
               )
 
-              print()
-              print("Telegram download completed.")
+              print("Download completed.")
 
               await client.disconnect()
 
 
           asyncio.run(main())
-
           PY
 
           python3 download.py
 
-          echo ""
-          echo "Downloaded files:"
-          ls -lh
-
-      # ========================================
-      # PREPARE VIDEO
-      # ========================================
-
-      - name: Prepare browser-compatible video
+      # =========================
+      # Convert to browser/VLC compatible MP4
+      # =========================
+      - name: Convert video to MP4
         run: |
 
-          FILE=$(find . -maxdepth 1 -type f -name 'telegram_video*' | head -n 1)
-
-          if [ -z "$FILE" ]; then
-            echo "ERROR: Video file not found."
-            exit 1
-          fi
-
-          echo "Input file:"
-          echo "$FILE"
-
-          echo ""
-          echo "Checking video..."
-
-          ffprobe \
-            -v error \
-            -show_entries format=format_name \
-            -show_entries stream=codec_name,codec_type \
-            -of default=noprint_wrappers=1 \
-            "$FILE" || true
-
-          echo ""
-          echo "Creating MP4..."
+          echo "Converting video..."
 
           ffmpeg \
-            -i "$FILE" \
+            -y \
+            -i telegram_original \
             -c:v libx264 \
             -preset veryfast \
             -crf 23 \
             -c:a aac \
             -b:a 192k \
             -movflags +faststart \
-            -y \
             video.mp4
 
-          echo ""
-          echo "========================================"
-          echo "VIDEO READY"
-          echo "========================================"
+          echo "Conversion completed."
 
           ls -lh video.mp4
 
-      # ========================================
-      # CREATE WEB SERVER
-      # ========================================
-
+      # =========================
+      # Create streaming server
+      # =========================
       - name: Create streaming server
         run: |
 
           cat > server.py <<'PY'
-
-          from fastapi import FastAPI
-          from fastapi.responses import HTMLResponse, FileResponse
-          import uvicorn
+          from fastapi import FastAPI, Request
+          from fastapi.responses import StreamingResponse
+          import os
 
 
           app = FastAPI()
+
+          VIDEO = "video.mp4"
 
 
           @app.get("/")
           async def home():
 
-              return HTMLResponse("""
-              <!DOCTYPE html>
+              return {
+                  "status": "online",
+                  "stream": "/video.mp4"
+              }
 
-              <html>
 
-              <head>
+          @app.get("/video.mp4")
+          async def video(request: Request):
 
-                  <meta charset="UTF-8">
+              file_size = os.path.getsize(VIDEO)
 
-                  <title>Telegram Video</title>
+              range_header = request.headers.get("range")
 
-                  <style>
+              if not range_header:
 
-                      html, body {
-                          margin: 0;
-                          padding: 0;
-                          width: 100%;
-                          height: 100%;
-                          background: #000;
-                          display: flex;
-                          align-items: center;
-                          justify-content: center;
+                  def full_file():
+
+                      with open(VIDEO, "rb") as f:
+
+                          while True:
+
+                              chunk = f.read(1024 * 1024)
+
+                              if not chunk:
+                                  break
+
+                              yield chunk
+
+                  return StreamingResponse(
+                      full_file(),
+                      media_type="video/mp4",
+                      headers={
+                          "Content-Length": str(file_size),
+                          "Accept-Ranges": "bytes",
+                          "Content-Disposition": "inline"
                       }
+                  )
 
-                      video {
-                          width: 100%;
-                          height: 100%;
-                          object-fit: contain;
+
+              # Parse HTTP Range
+
+              range_value = range_header.replace(
+                  "bytes=",
+                  ""
+              )
+
+              start, end = range_value.split("-")
+
+              start = int(start)
+
+              if end:
+                  end = int(end)
+              else:
+                  end = file_size - 1
+
+
+              if start >= file_size:
+
+                  return StreamingResponse(
+                      iter(()),
+                      status_code=416,
+                      headers={
+                          "Content-Range":
+                              f"bytes */{file_size}"
                       }
-
-                  </style>
-
-              </head>
-
-              <body>
-
-                  <video
-                      controls
-                      autoplay
-                      playsinline
-                      src="/video">
-                  </video>
-
-              </body>
-
-              </html>
-              """)
+                  )
 
 
-          @app.get("/video")
-          async def video():
+              end = min(end, file_size - 1)
 
-              return FileResponse(
-                  "video.mp4",
+              content_length = end - start + 1
+
+
+              def range_file():
+
+                  with open(VIDEO, "rb") as f:
+
+                      f.seek(start)
+
+                      remaining = content_length
+
+                      while remaining > 0:
+
+                          chunk_size = min(
+                              1024 * 1024,
+                              remaining
+                          )
+
+                          chunk = f.read(chunk_size)
+
+                          if not chunk:
+                              break
+
+                          yield chunk
+
+                          remaining -= len(chunk)
+
+
+              return StreamingResponse(
+                  range_file(),
+                  status_code=206,
                   media_type="video/mp4",
-                  filename="video.mp4"
+                  headers={
+                      "Content-Length":
+                          str(content_length),
+
+                      "Content-Range":
+                          f"bytes {start}-{end}/{file_size}",
+
+                      "Accept-Ranges": "bytes",
+
+                      "Content-Disposition":
+                          "inline"
+                  }
               )
 
 
-          uvicorn.run(
-              app,
-              host="0.0.0.0",
-              port=8080
-          )
+          if __name__ == "__main__":
 
+              import uvicorn
+
+              uvicorn.run(
+                  app,
+                  host="0.0.0.0",
+                  port=8080
+              )
           PY
 
           nohup python3 server.py > server.log 2>&1 &
@@ -318,16 +323,11 @@ jobs:
 
           echo "Server started."
 
-          curl -I http://127.0.0.1:8080/
-
-      # ========================================
-      # CREATE PUBLIC TEMPORARY LINK
-      # ========================================
-
+      # =========================
+      # Start Cloudflare Tunnel
+      # =========================
       - name: Start Cloudflare Tunnel
         run: |
-
-          echo "Starting temporary public tunnel..."
 
           nohup cloudflared tunnel \
             --url http://127.0.0.1:8080 \
@@ -340,8 +340,7 @@ jobs:
 
             URL=$(grep -oE \
               'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
-              cloudflared.log \
-              | head -n 1)
+              cloudflared.log | head -n 1)
 
             if [ -n "$URL" ]; then
               break
@@ -351,44 +350,55 @@ jobs:
 
           done
 
+
           if [ -z "$URL" ]; then
-            echo "ERROR: Cloudflare tunnel URL not found."
-            echo ""
+
+            echo "Could not get Cloudflare URL."
+
             cat cloudflared.log
+
             exit 1
+
           fi
 
+
+          STREAM_URL="${URL}/video.mp4"
+
+
           echo ""
-          echo "========================================"
-          echo "TELEGRAM VIDEO IS READY"
-          echo "========================================"
+          echo "=========================================="
+          echo "        TELEGRAM TEMPORARY STREAM"
+          echo "=========================================="
           echo ""
-          echo "OPEN THIS LINK:"
+          echo "Browser:"
+          echo "$STREAM_URL"
           echo ""
-          echo "$URL"
+          echo "VLC:"
+          echo "$STREAM_URL"
           echo ""
-          echo "========================================"
-          echo ""
-          echo "Keep this workflow running while watching."
-          echo "The link will stop working when this job ends."
+          echo "=========================================="
+          echo "The link is active while this job is running."
+          echo "=========================================="
           echo ""
 
-      # ========================================
-      # KEEP SERVER ALIVE
-      # ========================================
+          echo "STREAM_URL=$STREAM_URL" >> "$GITHUB_ENV"
 
+      # =========================
+      # Keep server alive
+      # =========================
       - name: Keep stream alive
         run: |
 
-          echo "Stream server is running..."
-          echo "Maximum lifetime: 30 minutes."
+          echo "Stream is now available:"
+          echo "$STREAM_URL"
+
           echo ""
+          echo "Waiting for 30 minutes..."
 
           for i in {1..30}; do
-            echo "[$i/30] Stream is active..."
-            sleep 60
-          done
 
-          echo ""
-          echo "30 minutes reached."
-          echo "Stopping stream."
+            echo "[$i/30] Stream active..."
+
+            sleep 60
+
+          done
