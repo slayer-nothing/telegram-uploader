@@ -1,3 +1,4 @@
+```yaml
 name: Telegram Temporary Stream
 
 on:
@@ -18,13 +19,11 @@ jobs:
       # =========================
       # Install dependencies
       # =========================
-      - name: Install system packages
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl python3-pip
+          sudo apt-get install -y curl python3-pip
 
-      - name: Install Python packages
-        run: |
           pip install telethon cryptg fastapi uvicorn
 
       # =========================
@@ -42,12 +41,13 @@ jobs:
       # =========================
       # Download Telegram video
       # =========================
-      - name: Download Telegram video
+      - name: Download Telegram media
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
           TELEGRAM_URL: ${{ inputs.telegram_url }}
+
         run: |
 
           cat > download.py <<'PY'
@@ -73,9 +73,7 @@ jobs:
               )
 
               if not m:
-                  raise ValueError(
-                      "Invalid Telegram message URL"
-                  )
+                  raise ValueError("Invalid Telegram message URL")
 
               username = m.group(1)
               message_id = int(m.group(2))
@@ -104,24 +102,21 @@ jobs:
               )
 
               if not message:
-                  raise RuntimeError(
-                      "Telegram message not found"
-                  )
+                  raise RuntimeError("Telegram message not found")
 
               if not message.media:
-                  raise RuntimeError(
-                      "This message has no media"
-                  )
+                  raise RuntimeError("This message has no media")
 
               print("Media found.")
 
-              file_name = "telegram_original"
+              # Get original filename if Telegram provides one
+              original_name = None
 
               if message.file:
+
                   if message.file.name:
-                      print(
-                          f"Original filename: {message.file.name}"
-                      )
+                      original_name = message.file.name
+                      print(f"Original filename: {original_name}")
 
                   if message.file.size:
                       print(
@@ -129,14 +124,25 @@ jobs:
                           f"{message.file.size / 1024 / 1024:.2f} MB"
                       )
 
+              # Fallback filename
+              if not original_name:
+                  original_name = "telegram_media"
+
+              # Prevent path traversal
+              original_name = os.path.basename(original_name)
+
+              print(f"Saving as: {original_name}")
               print("Downloading...")
 
-              await client.download_media(
+              downloaded = await client.download_media(
                   message,
-                  file=file_name
+                  file=original_name
               )
 
-              print("Download completed.")
+              if not downloaded:
+                  raise RuntimeError("Download failed")
+
+              print(f"Downloaded file: {downloaded}")
 
               await client.disconnect()
 
@@ -146,28 +152,40 @@ jobs:
 
           python3 download.py
 
+          echo ""
+          echo "Downloaded files:"
+          ls -lah
+
       # =========================
-      # Convert to browser/VLC compatible MP4
+      # Detect downloaded media
       # =========================
-      - name: Convert video to MP4
+      - name: Detect media file
         run: |
 
-          echo "Converting video..."
+          MEDIA_FILE=$(find . -maxdepth 1 -type f \
+            ! -name "download.py" \
+            ! -name "*.log" \
+            | head -n 1)
 
-          ffmpeg \
-            -y \
-            -i telegram_original \
-            -c:v libx264 \
-            -preset veryfast \
-            -crf 23 \
-            -c:a aac \
-            -b:a 192k \
-            -movflags +faststart \
-            video.mp4
+          if [ -z "$MEDIA_FILE" ]; then
+            echo "No downloaded media file found."
+            exit 1
+          fi
 
-          echo "Conversion completed."
+          MEDIA_FILE="${MEDIA_FILE#./}"
 
-          ls -lh video.mp4
+          echo "Media file detected:"
+          echo "$MEDIA_FILE"
+
+          echo "MEDIA_FILE=$MEDIA_FILE" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "File information:"
+          file "$MEDIA_FILE"
+
+          echo ""
+          echo "File size:"
+          ls -lh "$MEDIA_FILE"
 
       # =========================
       # Create streaming server
@@ -177,13 +195,21 @@ jobs:
 
           cat > server.py <<'PY'
           from fastapi import FastAPI, Request
-          from fastapi.responses import StreamingResponse
+          from fastapi.responses import StreamingResponse, Response
           import os
+          import mimetypes
 
 
           app = FastAPI()
 
-          VIDEO = "video.mp4"
+          VIDEO = os.environ["MEDIA_FILE"]
+
+          file_size = os.path.getsize(VIDEO)
+
+          mime_type, _ = mimetypes.guess_type(VIDEO)
+
+          if not mime_type:
+              mime_type = "application/octet-stream"
 
 
           @app.get("/")
@@ -191,16 +217,20 @@ jobs:
 
               return {
                   "status": "online",
-                  "stream": "/video.mp4"
+                  "file": os.path.basename(VIDEO),
+                  "size": file_size,
+                  "stream": "/media"
               }
 
 
-          @app.get("/video.mp4")
-          async def video(request: Request):
-
-              file_size = os.path.getsize(VIDEO)
+          @app.get("/media")
+          async def media(request: Request):
 
               range_header = request.headers.get("range")
+
+              # =========================
+              # Full file request
+              # =========================
 
               if not range_header:
 
@@ -219,7 +249,7 @@ jobs:
 
                   return StreamingResponse(
                       full_file(),
-                      media_type="video/mp4",
+                      media_type=mime_type,
                       headers={
                           "Content-Length": str(file_size),
                           "Accept-Ranges": "bytes",
@@ -228,27 +258,66 @@ jobs:
                   )
 
 
-              # Parse HTTP Range
+              # =========================
+              # HTTP Range request
+              # =========================
+
+              if not range_header.startswith("bytes="):
+
+                  return Response(
+                      status_code=416,
+                      headers={
+                          "Content-Range": f"bytes */{file_size}"
+                      }
+                  )
+
 
               range_value = range_header.replace(
                   "bytes=",
-                  ""
+                  "",
+                  1
               )
 
-              start, end = range_value.split("-")
+              # Handle only one range
+              range_value = range_value.split(",")[0]
 
-              start = int(start)
+              start_str, end_str = range_value.split("-")
 
-              if end:
-                  end = int(end)
+              if start_str:
+
+                  start = int(start_str)
+
+                  if end_str:
+                      end = int(end_str)
+                  else:
+                      end = file_size - 1
+
               else:
+
+                  # bytes=-500000
+                  suffix_length = int(end_str)
+
+                  if suffix_length <= 0:
+                      return Response(
+                          status_code=416,
+                          headers={
+                              "Content-Range":
+                                  f"bytes */{file_size}"
+                          }
+                      )
+
+                  suffix_length = min(
+                      suffix_length,
+                      file_size
+                  )
+
+                  start = file_size - suffix_length
                   end = file_size - 1
 
 
-              if start >= file_size:
+              if start >= file_size or start > end:
 
-                  return StreamingResponse(
-                      iter(()),
+                  return Response(
                       status_code=416,
                       headers={
                           "Content-Range":
@@ -257,7 +326,10 @@ jobs:
                   )
 
 
-              end = min(end, file_size - 1)
+              end = min(
+                  end,
+                  file_size - 1
+              )
 
               content_length = end - start + 1
 
@@ -290,7 +362,7 @@ jobs:
               return StreamingResponse(
                   range_file(),
                   status_code=206,
-                  media_type="video/mp4",
+                  media_type=mime_type,
                   headers={
                       "Content-Length":
                           str(content_length),
@@ -298,7 +370,8 @@ jobs:
                       "Content-Range":
                           f"bytes {start}-{end}/{file_size}",
 
-                      "Accept-Ranges": "bytes",
+                      "Accept-Ranges":
+                          "bytes",
 
                       "Content-Disposition":
                           "inline"
@@ -323,6 +396,10 @@ jobs:
 
           echo "Server started."
 
+          echo ""
+          echo "Server status:"
+          curl -I http://127.0.0.1:8080/media || true
+
       # =========================
       # Start Cloudflare Tunnel
       # =========================
@@ -336,11 +413,14 @@ jobs:
 
           echo "Waiting for tunnel..."
 
+          URL=""
+
           for i in {1..30}; do
 
             URL=$(grep -oE \
               'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
-              cloudflared.log | head -n 1)
+              cloudflared.log \
+              | head -n 1)
 
             if [ -n "$URL" ]; then
               break
@@ -355,6 +435,8 @@ jobs:
 
             echo "Could not get Cloudflare URL."
 
+            echo ""
+            echo "Cloudflare log:"
             cat cloudflared.log
 
             exit 1
@@ -362,13 +444,22 @@ jobs:
           fi
 
 
-          STREAM_URL="${URL}/video.mp4"
+          STREAM_URL="${URL}/media"
 
 
           echo ""
           echo "=========================================="
-          echo "        TELEGRAM TEMPORARY STREAM"
+          echo "       TELEGRAM TEMPORARY STREAM"
           echo "=========================================="
+          echo ""
+          echo "File:"
+          echo "$MEDIA_FILE"
+          echo ""
+          echo "MIME:"
+          file --mime-type "$MEDIA_FILE"
+          echo ""
+          echo "Stream URL:"
+          echo "$STREAM_URL"
           echo ""
           echo "Browser:"
           echo "$STREAM_URL"
@@ -384,7 +475,7 @@ jobs:
           echo "STREAM_URL=$STREAM_URL" >> "$GITHUB_ENV"
 
       # =========================
-      # Keep server alive
+      # Keep stream alive
       # =========================
       - name: Keep stream alive
         run: |
@@ -402,3 +493,4 @@ jobs:
             sleep 60
 
           done
+```
