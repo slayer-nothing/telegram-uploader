@@ -21,9 +21,11 @@ jobs:
       # ==========================================
       # 1. Install dependencies
       # ==========================================
+
       - name: Install dependencies
         shell: bash
         run: |
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -33,14 +35,22 @@ jobs:
             python3-pip
 
           python3 -m pip install --upgrade pip
-          python3 -m pip install telethon cryptg fastapi uvicorn
+
+          python3 -m pip install \
+            telethon \
+            cryptg \
+            fastapi \
+            uvicorn
+
 
       # ==========================================
       # 2. Install Cloudflare Tunnel
       # ==========================================
+
       - name: Install cloudflared
         shell: bash
         run: |
+
           curl -L \
             --output cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -49,18 +59,22 @@ jobs:
 
           cloudflared --version
 
+
       # ==========================================
       # 3. Create Telegram downloader
       # ==========================================
+
       - name: Create download script
         shell: bash
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+
         run: |
 
           cat > download.py <<'PYTHON'
+
           import os
           import re
           import time
@@ -76,15 +90,27 @@ jobs:
           URL = os.environ["TELEGRAM_URL"]
 
 
+          # ==========================================
+          # Format file size
+          # ==========================================
+
           def format_size(size):
+
               if size is None:
                   return "0 B"
 
-              units = ["B", "KB", "MB", "GB", "TB"]
+              units = [
+                  "B",
+                  "KB",
+                  "MB",
+                  "GB",
+                  "TB"
+              ]
 
               size = float(size)
 
               for unit in units:
+
                   if size < 1024:
                       return f"{size:.2f} {unit}"
 
@@ -93,7 +119,12 @@ jobs:
               return f"{size:.2f} PB"
 
 
+          # ==========================================
+          # Format time
+          # ==========================================
+
           def format_time(seconds):
+
               if seconds is None or seconds < 0:
                   return "--:--"
 
@@ -104,9 +135,17 @@ jobs:
               secs = seconds % 60
 
               if hours > 0:
-                  return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-              return f"{minutes:02d}:{secs:02d}"
+                  return (
+                      f"{hours:02d}:"
+                      f"{minutes:02d}:"
+                      f"{secs:02d}"
+                  )
+
+              return (
+                  f"{minutes:02d}:"
+                  f"{secs:02d}"
+              )
 
 
           # ==========================================
@@ -118,9 +157,12 @@ jobs:
               URL
           )
 
+
           if not match:
+
               raise ValueError(
-                  "Invalid Telegram URL. Expected something like "
+                  "Invalid Telegram URL. "
+                  "Expected something like "
                   "https://t.me/channel/123"
               )
 
@@ -128,6 +170,10 @@ jobs:
           username = match.group(1)
           message_id = int(match.group(2))
 
+
+          # ==========================================
+          # Main
+          # ==========================================
 
           async def main():
 
@@ -151,7 +197,7 @@ jobs:
 
 
               # ==========================================
-              # Get message
+              # Get Telegram message
               # ==========================================
 
               message = await client.get_messages(
@@ -161,12 +207,14 @@ jobs:
 
 
               if not message:
+
                   raise RuntimeError(
                       "Telegram message not found."
                   )
 
 
               if not message.media:
+
                   raise RuntimeError(
                       "This Telegram message does not contain media."
                   )
@@ -177,7 +225,7 @@ jobs:
 
 
               # ==========================================
-              # Detect filename
+              # Filename
               # ==========================================
 
               filename = None
@@ -195,7 +243,7 @@ jobs:
 
 
               # ==========================================
-              # Detect size
+              # File size
               # ==========================================
 
               total_size = None
@@ -205,16 +253,24 @@ jobs:
                   total_size = message.file.size
 
 
-              print(f"Original filename: {filename}")
+              print(
+                  f"Original filename: {filename}"
+              )
 
 
               if total_size:
+
                   print(
-                      f"File size: {format_size(total_size)}"
+                      f"File size: "
+                      f"{format_size(total_size)}"
                   )
 
 
-              print(f"Saving as: {filename}")
+              print(
+                  f"Saving as: {filename}"
+              )
+
+
               print("")
               print("Downloading...")
               print("")
@@ -228,7 +284,10 @@ jobs:
               last_print = 0
 
 
-              def progress_callback(current, total):
+              def progress_callback(
+                  current,
+                  total
+              ):
 
                   nonlocal start_time
                   nonlocal last_print
@@ -237,7 +296,6 @@ jobs:
                   now = time.time()
 
 
-                  # Print approximately once per second
                   if (
                       now - last_print < 1
                       and current < total
@@ -300,23 +358,29 @@ jobs:
 
 
               print("")
+
               print("========================================")
               print("Download completed.")
-              print(f"Downloaded file: {downloaded}")
+              print(
+                  f"Downloaded file: {downloaded}"
+              )
               print("========================================")
 
 
               # ==========================================
-              # Verify downloaded file
+              # Verify download
               # ==========================================
 
               if not downloaded:
+
                   raise RuntimeError(
-                      "Telegram download returned no file path."
+                      "Telegram download returned "
+                      "no file path."
                   )
 
 
               if not os.path.isfile(downloaded):
+
                   raise RuntimeError(
                       "Downloaded file does not exist: "
                       + str(downloaded)
@@ -324,7 +388,7 @@ jobs:
 
 
               # ==========================================
-              # Save exact downloaded file path
+              # Save exact media path
               # ==========================================
 
               downloaded_path = os.path.abspath(
@@ -350,30 +414,41 @@ jobs:
 
 
           asyncio.run(main())
+
           PYTHON
+
 
       # ==========================================
       # 4. Download Telegram media
       # ==========================================
+
       - name: Download Telegram media
         shell: bash
+
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+
         run: |
+
           python3 download.py
 
+
       # ==========================================
-      # 5. Detect exact downloaded media
+      # 5. Detect exact media file
       # ==========================================
+
       - name: Detect media file
         shell: bash
         run: |
 
           if [ ! -f "downloaded_media.txt" ]; then
-            echo "ERROR: downloaded_media.txt was not found."
-            exit 1
+
+              echo "ERROR: downloaded_media.txt was not found."
+
+              exit 1
+
           fi
 
 
@@ -381,15 +456,22 @@ jobs:
 
 
           if [ -z "$MEDIA_FILE" ]; then
-            echo "ERROR: Media filename is empty."
-            exit 1
+
+              echo "ERROR: Media filename is empty."
+
+              exit 1
+
           fi
 
 
           if [ ! -f "$MEDIA_FILE" ]; then
-            echo "ERROR: Media file does not exist:"
-            echo "$MEDIA_FILE"
-            exit 1
+
+              echo "ERROR: Media file does not exist:"
+
+              echo "$MEDIA_FILE"
+
+              exit 1
+
           fi
 
 
@@ -400,20 +482,26 @@ jobs:
           echo "$MEDIA_FILE"
 
           echo ""
+
           echo "File information:"
+
           file "$MEDIA_FILE"
 
           echo ""
+
           echo "File size:"
+
           ls -lh "$MEDIA_FILE"
 
           echo ""
 
           echo "MEDIA_FILE=$MEDIA_FILE" >> "$GITHUB_ENV"
 
+
       # ==========================================
-      # 6. Show media information
+      # 6. Inspect media
       # ==========================================
+
       - name: Inspect media
         shell: bash
         run: |
@@ -427,14 +515,17 @@ jobs:
             "$MEDIA_FILE" \
             || true
 
+
       # ==========================================
-      # 7. Convert / Remux to MP4
+      # 7. Convert to MP4
       # ==========================================
+
       - name: Convert to MP4
         shell: bash
         run: |
 
           INPUT="$MEDIA_FILE"
+
           OUTPUT="${INPUT%.*}.mp4"
 
 
@@ -445,6 +536,36 @@ jobs:
 
           echo "Input : $INPUT"
           echo "Output: $OUTPUT"
+
+          echo ""
+
+
+          # ==========================================
+          # Detect video codec
+          # ==========================================
+
+          VIDEO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=codec_name \
+            -of csv=p=0 \
+            "$INPUT")
+
+
+          # ==========================================
+          # Detect audio codec
+          # ==========================================
+
+          AUDIO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of csv=p=0 \
+            "$INPUT")
+
+
+          echo "Video codec: ${VIDEO_CODEC:-none}"
+          echo "Audio codec: ${AUDIO_CODEC:-none}"
 
           echo ""
 
@@ -461,108 +582,210 @@ jobs:
 
 
           if [ -z "$DURATION" ]; then
-            echo "ERROR: Could not determine duration."
-            exit 1
+
+              echo "ERROR: Could not determine duration."
+
+              exit 1
+
           fi
 
 
           echo "Duration: ${DURATION}s"
-          echo ""
 
-
-          echo "Mode: COPY"
-          echo "No video re-encoding."
-          echo "No audio re-encoding."
-          echo ""
-
-
-          echo "Converting container to MP4..."
           echo ""
 
 
           # ==========================================
-          # Remux
+          # CASE 1
+          # H.264 + AAC
           # ==========================================
 
-          ffmpeg \
-            -hide_banner \
-            -progress pipe:1 \
-            -nostats \
-            -i "$INPUT" \
-            -map 0 \
-            -c copy \
-            -movflags +faststart \
-            -y "$OUTPUT" 2>&1 |
-          while IFS= read -r line
-          do
-
-              case "$line" in
-
-                  out_time_us=*)
-
-                      TIME_US="${line#out_time_us=}"
+          if [ "$VIDEO_CODEC" = "h264" ] && \
+             [ "$AUDIO_CODEC" = "aac" ]; then
 
 
-                      if [ "$TIME_US" != "N/A" ]; then
+              echo "========================================"
+              echo "H.264 + AAC detected"
+              echo "========================================"
 
-                          TIME_SEC=$(awk \
-                            -v x="$TIME_US" \
-                            'BEGIN {print x/1000000}'
-                          )
-
-
-                          PERCENT=$(awk \
-                            -v t="$TIME_SEC" \
-                            -v d="$DURATION" \
-                            'BEGIN {
-                              if (d > 0)
-                                printf "%.1f", (t/d)*100
-                              else
-                                print "0"
-                            }'
-                          )
+              echo ""
+              echo "No video re-encoding."
+              echo "No audio re-encoding."
+              echo "Using direct MP4 remux."
+              echo ""
 
 
-                          CURRENT=$(awk \
-                            -v t="$TIME_SEC" \
-                            'BEGIN {
-                              h=int(t/3600)
-                              m=int((t%3600)/60)
-                              s=int(t%60)
-                              printf "%02d:%02d:%02d",h,m,s
-                            }'
-                          )
+              set +e
 
 
-                          TOTAL=$(awk \
-                            -v d="$DURATION" \
-                            'BEGIN {
-                              h=int(d/3600)
-                              m=int((d%3600)/60)
-                              s=int(d%60)
-                              printf "%02d:%02d:%02d",h,m,s
-                            }'
-                          )
+              ffmpeg \
+                -hide_banner \
+                -i "$INPUT" \
+                -map 0 \
+                -c copy \
+                -movflags +faststart \
+                -y "$OUTPUT"
 
 
-                          echo \
-                            "[${PERCENT}%] ${CURRENT} / ${TOTAL}"
-
-                      fi
-
-                      ;;
+              FFMPEG_EXIT_CODE=$?
 
 
-                  progress=end)
+              set -e
 
-                      echo ""
-                      echo "MP4 processing finished."
 
-                      ;;
+              if [ "$FFMPEG_EXIT_CODE" -ne 0 ]; then
 
-              esac
+                  echo ""
+                  echo "Direct remux failed."
+                  echo ""
+                  echo "Trying compatible MP4 conversion..."
+                  echo ""
 
-          done
+
+                  ffmpeg \
+                    -hide_banner \
+                    -i "$INPUT" \
+                    -map 0:v:0 \
+                    -map 0:a:0? \
+                    -c:v libx264 \
+                    -preset medium \
+                    -crf 16 \
+                    -c:a aac \
+                    -b:a 192k \
+                    -movflags +faststart \
+                    -y "$OUTPUT"
+
+              fi
+
+
+          # ==========================================
+          # CASE 2
+          # Other codecs
+          # ==========================================
+
+          else
+
+
+              echo "========================================"
+              echo "Codec conversion required"
+              echo "========================================"
+
+              echo ""
+
+              echo "Target:"
+              echo "Video: H.264"
+              echo "Audio: AAC"
+
+              echo ""
+
+              echo "Video settings:"
+              echo "Codec : libx264"
+              echo "Preset: medium"
+              echo "CRF   : 16"
+
+              echo ""
+
+              echo "Audio settings:"
+              echo "Codec : AAC"
+              echo "Bitrate: 192k"
+
+              echo ""
+
+
+              # ==========================================
+              # Encode
+              # ==========================================
+
+              ffmpeg \
+                -hide_banner \
+                -i "$INPUT" \
+                -map 0:v:0 \
+                -map 0:a:0? \
+                -c:v libx264 \
+                -preset medium \
+                -crf 16 \
+                -c:a aac \
+                -b:a 192k \
+                -movflags +faststart \
+                -progress pipe:1 \
+                -nostats \
+                -y "$OUTPUT" 2>&1 |
+
+              while IFS= read -r line
+              do
+
+                  case "$line" in
+
+                      out_time_us=*)
+
+                          TIME_US="${line#out_time_us=}"
+
+
+                          if [ "$TIME_US" != "N/A" ]; then
+
+
+                              TIME_SEC=$(awk \
+                                -v x="$TIME_US" \
+                                'BEGIN {
+                                  print x/1000000
+                                }'
+                              )
+
+
+                              PERCENT=$(awk \
+                                -v t="$TIME_SEC" \
+                                -v d="$DURATION" \
+                                'BEGIN {
+                                  if (d > 0)
+                                    printf "%.1f", (t/d)*100
+                                  else
+                                    print "0"
+                                }'
+                              )
+
+
+                              CURRENT=$(awk \
+                                -v t="$TIME_SEC" \
+                                'BEGIN {
+                                  h=int(t/3600)
+                                  m=int((t%3600)/60)
+                                  s=int(t%60)
+                                  printf "%02d:%02d:%02d",h,m,s
+                                }'
+                              )
+
+
+                              TOTAL=$(awk \
+                                -v d="$DURATION" \
+                                'BEGIN {
+                                  h=int(d/3600)
+                                  m=int((d%3600)/60)
+                                  s=int(d%60)
+                                  printf "%02d:%02d:%02d",h,m,s
+                                }'
+                              )
+
+
+                              echo \
+                                "[${PERCENT}%] ${CURRENT} / ${TOTAL}"
+
+                          fi
+
+                          ;;
+
+
+                      progress=end)
+
+                          echo ""
+                          echo "Encoding finished."
+
+                          ;;
+
+                  esac
+
+              done
+
+          fi
 
 
           # ==========================================
@@ -572,7 +795,9 @@ jobs:
           if [ ! -f "$OUTPUT" ]; then
 
               echo ""
-              echo "ERROR: MP4 file was not created."
+              echo "========================================"
+              echo "ERROR: MP4 was not created"
+              echo "========================================"
 
               exit 1
 
@@ -584,6 +809,8 @@ jobs:
           echo "MP4 created successfully"
           echo "========================================"
 
+          echo ""
+
           echo "Output:"
           echo "$OUTPUT"
 
@@ -594,7 +821,24 @@ jobs:
 
           echo ""
 
-          echo "MP4 information:"
+          echo "========================================"
+          echo "Final MP4 codec information"
+          echo "========================================"
+
+
+          ffprobe \
+            -v error \
+            -show_entries stream=index,codec_type,codec_name,codec_long_name,width,height,r_frame_rate \
+            -of default=noprint_wrappers=1 \
+            "$OUTPUT"
+
+
+          echo ""
+
+          echo "========================================"
+          echo "Final MP4 details"
+          echo "========================================"
+
 
           ffprobe \
             -hide_banner \
@@ -608,14 +852,17 @@ jobs:
 
           echo "MEDIA_FILE=$OUTPUT" >> "$GITHUB_ENV"
 
+
       # ==========================================
-      # 8. Create FastAPI server
+      # 8. Create FastAPI streaming server
       # ==========================================
+
       - name: Create streaming server
         shell: bash
         run: |
 
           cat > server.py <<'PYTHON'
+
           import os
           import mimetypes
 
@@ -634,12 +881,15 @@ jobs:
 
 
           if not os.path.isfile(FILE_PATH):
+
               raise RuntimeError(
                   f"Media file not found: {FILE_PATH}"
               )
 
 
-          FILE_SIZE = os.path.getsize(FILE_PATH)
+          FILE_SIZE = os.path.getsize(
+              FILE_PATH
+          )
 
 
           MIME_TYPE, _ = mimetypes.guess_type(
@@ -648,8 +898,13 @@ jobs:
 
 
           if not MIME_TYPE:
+
               MIME_TYPE = "video/mp4"
 
+
+          # ==========================================
+          # Parse HTTP Range
+          # ==========================================
 
           def parse_range(range_header):
 
@@ -657,7 +912,9 @@ jobs:
                   return None
 
 
-              if not range_header.startswith("bytes="):
+              if not range_header.startswith(
+                  "bytes="
+              ):
                   return None
 
 
@@ -668,10 +925,14 @@ jobs:
               )
 
 
-              start, end = value.split("-", 1)
+              start, end = value.split(
+                  "-",
+                  1
+              )
 
 
               if start == "":
+
                   length = int(end)
 
                   start = max(
@@ -687,6 +948,7 @@ jobs:
 
                   if end:
                       end = int(end)
+
                   else:
                       end = FILE_SIZE - 1
 
@@ -706,13 +968,26 @@ jobs:
               return start, end
 
 
-          def file_iterator(start, end):
+          # ==========================================
+          # File iterator
+          # ==========================================
 
-              with open(FILE_PATH, "rb") as file:
+          def file_iterator(
+              start,
+              end
+          ):
+
+              with open(
+                  FILE_PATH,
+                  "rb"
+              ) as file:
 
                   file.seek(start)
 
-                  remaining = end - start + 1
+
+                  remaining = (
+                      end - start + 1
+                  )
 
 
                   while remaining > 0:
@@ -734,37 +1009,64 @@ jobs:
 
                       remaining -= len(data)
 
+
                       yield data
 
+
+          # ==========================================
+          # Root
+          # ==========================================
 
           @app.get("/")
           async def root():
 
               return {
                   "status": "online",
-                  "file": os.path.basename(FILE_PATH),
+                  "file": os.path.basename(
+                      FILE_PATH
+                  ),
                   "size": FILE_SIZE
               }
 
+
+          # ==========================================
+          # HEAD /media
+          # ==========================================
 
           @app.head("/media")
           async def media_head():
 
               return Response(
+
                   status_code=200,
+
                   headers={
-                      "Content-Type": MIME_TYPE,
-                      "Content-Length": str(FILE_SIZE),
-                      "Accept-Ranges": "bytes"
+
+                      "Content-Type":
+                          MIME_TYPE,
+
+                      "Content-Length":
+                          str(FILE_SIZE),
+
+                      "Accept-Ranges":
+                          "bytes"
                   }
               )
 
 
-          @app.get("/media")
-          async def media(request: Request):
+          # ==========================================
+          # GET /media
+          # ==========================================
 
-              range_header = request.headers.get(
-                  "range"
+          @app.get("/media")
+          async def media(
+              request: Request
+          ):
+
+              range_header = (
+                  request.headers.get(
+                      "range"
+                  )
               )
 
 
@@ -780,11 +1082,18 @@ jobs:
               if byte_range is None:
 
                   return FileResponse(
+
                       FILE_PATH,
+
                       media_type=MIME_TYPE,
+
                       headers={
-                          "Accept-Ranges": "bytes",
-                          "Content-Length": str(FILE_SIZE)
+
+                          "Accept-Ranges":
+                              "bytes",
+
+                          "Content-Length":
+                              str(FILE_SIZE)
                       }
                   )
 
@@ -818,16 +1127,26 @@ jobs:
 
 
               return StreamingResponse(
-                  file_iterator(start, end),
+
+                  file_iterator(
+                      start,
+                      end
+                  ),
+
                   status_code=206,
+
                   headers=headers,
+
                   media_type=MIME_TYPE
               )
+
           PYTHON
 
+
       # ==========================================
-      # 9. Start FastAPI server
+      # 9. Start FastAPI
       # ==========================================
+
       - name: Start streaming server
         shell: bash
         run: |
@@ -854,9 +1173,11 @@ jobs:
             http://127.0.0.1:8080/media \
             || true
 
+
       # ==========================================
       # 10. Start Cloudflare Quick Tunnel
       # ==========================================
+
       - name: Start Cloudflare tunnel
         shell: bash
         run: |
@@ -889,7 +1210,8 @@ jobs:
               URL=$(grep -oE \
                 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
                 cloudflared.log \
-                | head -n 1 || true)
+                | head -n 1 \
+                || true)
 
 
               if [ -n "$URL" ]; then
@@ -910,7 +1232,9 @@ jobs:
               echo "ERROR: Cloudflare tunnel URL was not found."
 
               echo ""
+
               echo "Cloudflare log:"
+
               cat cloudflared.log
 
               exit 1
@@ -927,7 +1251,9 @@ jobs:
           echo "========================================"
 
           echo ""
+
           echo "Open this URL:"
+
           echo ""
 
           echo "$STREAM_URL"
@@ -935,11 +1261,13 @@ jobs:
           echo ""
 
           echo "VLC:"
+
           echo "$STREAM_URL"
 
           echo ""
 
           echo "Browser:"
+
           echo "$STREAM_URL"
 
           echo ""
@@ -949,24 +1277,31 @@ jobs:
 
           echo "STREAM_URL=$STREAM_URL" >> "$GITHUB_ENV"
 
+
       # ==========================================
       # 11. Keep stream alive
       # ==========================================
+
       - name: Keep stream alive
         shell: bash
         run: |
 
           echo ""
+
           echo "========================================"
           echo "Stream is active"
           echo "========================================"
 
           echo ""
+
           echo "URL:"
+
           echo "$STREAM_URL"
 
           echo ""
+
           echo "The stream will stay active for 30 minutes."
+
           echo ""
 
 
@@ -981,6 +1316,7 @@ jobs:
 
 
           echo ""
+
           echo "========================================"
           echo "Stream expired"
           echo "========================================"
