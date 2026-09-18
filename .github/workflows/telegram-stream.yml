@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       telegram_url:
-        description: "Telegram public message URL"
+        description: "Public Telegram message URL"
         required: true
         type: string
 
@@ -13,37 +13,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
+    env:
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+      TELEGRAM_URL: ${{ inputs.telegram_url }}
+
     steps:
+
+      # ============================================================
+      # 1. Install dependencies
+      # ============================================================
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl python3-pip
+          sudo apt-get install -y ffmpeg curl python3-pip
 
-          pip install telethon cryptg fastapi uvicorn
+          pip3 install --upgrade pip
+          pip3 install telethon cryptg fastapi uvicorn
+
+      # ============================================================
+      # 2. Install Cloudflare Tunnel
+      # ============================================================
 
       - name: Install cloudflared
         run: |
           curl -L \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o cloudflared
+            --output cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
 
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/cloudflared
+          sudo dpkg -i cloudflared.deb
+
+          cloudflared --version
+
+      # ============================================================
+      # 3. Download Telegram media
+      # ============================================================
 
       - name: Download Telegram media
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
-          TELEGRAM_URL: ${{ inputs.telegram_url }}
-
+        shell: bash
         run: |
 
           cat > download.py <<'PY'
           import os
           import re
-          import asyncio
+          import time
 
           from telethon import TelegramClient
           from telethon.sessions import StringSession
@@ -55,28 +70,66 @@ jobs:
           URL = os.environ["TELEGRAM_URL"]
 
 
-          def parse_url(url):
+          def format_size(size):
+              if size is None:
+                  return "0 B"
 
-              m = re.search(
-                  r"https?://t\.me/(?:s/)?([^/?#]+)/(\d+)",
-                  url
+              units = ["B", "KB", "MB", "GB", "TB"]
+
+              size = float(size)
+
+              for unit in units:
+                  if size < 1024:
+                      return f"{size:.2f} {unit}"
+
+                  size /= 1024
+
+              return f"{size:.2f} PB"
+
+
+          def format_time(seconds):
+              if seconds is None or seconds < 0:
+                  return "--:--"
+
+              seconds = int(seconds)
+
+              hours = seconds // 3600
+              minutes = (seconds % 3600) // 60
+              secs = seconds % 60
+
+              if hours > 0:
+                  return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+              return f"{minutes:02d}:{secs:02d}"
+
+
+          # ------------------------------------------------------------
+          # Parse Telegram URL
+          # ------------------------------------------------------------
+
+          match = re.match(
+              r"https?://t\.me/(?:s/)?([^/]+)/(\d+)",
+              URL
+          )
+
+          if not match:
+              raise ValueError(
+                  "Invalid Telegram URL. "
+                  "Expected something like https://t.me/channel/123"
               )
 
-              if not m:
-                  raise ValueError("Invalid Telegram message URL")
 
-              username = m.group(1)
-              message_id = int(m.group(2))
-
-              return username, message_id
+          username = match.group(1)
+          message_id = int(match.group(2))
 
 
           async def main():
 
-              username, message_id = parse_url(URL)
+              print("")
+              print("========================================")
+              print("Connecting to Telegram...")
+              print("========================================")
 
-              print(f"Telegram: @{username}")
-              print(f"Message ID: {message_id}")
 
               client = TelegramClient(
                   StringSession(SESSION),
@@ -84,75 +137,191 @@ jobs:
                   API_HASH
               )
 
+
               await client.start()
+
+              print("Connected.")
+              print("")
+
 
               message = await client.get_messages(
                   username,
                   ids=message_id
               )
 
+
               if not message:
-                  raise RuntimeError("Telegram message not found")
+                  raise RuntimeError(
+                      "Telegram message not found."
+                  )
+
 
               if not message.media:
-                  raise RuntimeError("This message has no media")
+                  raise RuntimeError(
+                      "This Telegram message does not contain media."
+                  )
+
 
               print("Media found.")
+              print("")
+
+
+              # --------------------------------------------------------
+              # Original filename
+              # --------------------------------------------------------
 
               filename = None
 
+
               if message.file:
+                  filename = message.file.name
 
-                  if message.file.name:
-                      filename = message.file.name
-                      print(f"Original filename: {filename}")
-
-                  if message.file.size:
-                      print(
-                          f"Telegram file size: "
-                          f"{message.file.size / 1024 / 1024:.2f} MB"
-                      )
 
               if not filename:
                   filename = "telegram_media"
 
+
+              # Prevent path traversal / weird paths
+
               filename = os.path.basename(filename)
 
+
+              # --------------------------------------------------------
+              # File size
+              # --------------------------------------------------------
+
+              total_size = None
+
+              if message.file:
+                  total_size = message.file.size
+
+
+              print(f"Original filename: {filename}")
+
+              if total_size:
+                  print(f"File size: {format_size(total_size)}")
+
+
+              print("")
               print(f"Saving as: {filename}")
+              print("")
               print("Downloading...")
+
+
+              start_time = time.time()
+              last_print = 0
+
+
+              # --------------------------------------------------------
+              # Progress callback
+              # --------------------------------------------------------
+
+              def progress_callback(current, total):
+
+                  nonlocal start_time
+                  nonlocal last_print
+
+                  now = time.time()
+
+                  # Print approximately once per second
+
+                  if (
+                      now - last_print < 1
+                      and current < total
+                  ):
+                      return
+
+
+                  last_print = now
+
+
+                  elapsed = max(
+                      now - start_time,
+                      0.001
+                  )
+
+
+                  speed = current / elapsed
+
+
+                  percentage = (
+                      current / total * 100
+                      if total
+                      else 0
+                  )
+
+
+                  remaining = (
+                      total - current
+                      if total
+                      else 0
+                  )
+
+
+                  eta = (
+                      remaining / speed
+                      if speed > 0
+                      else 0
+                  )
+
+
+                  print(
+                      f"[{percentage:6.2f}%] "
+                      f"{format_size(current)} / "
+                      f"{format_size(total)} | "
+                      f"{format_size(speed)}/s | "
+                      f"ETA {format_time(eta)}",
+                      flush=True
+                  )
+
+
+              # --------------------------------------------------------
+              # Download
+              # --------------------------------------------------------
 
               downloaded = await client.download_media(
                   message,
-                  file=filename
+                  file=filename,
+                  progress_callback=progress_callback
               )
 
-              if not downloaded:
-                  raise RuntimeError("Download failed")
 
+              print("")
+              print("========================================")
+              print("Download completed.")
               print(f"Downloaded file: {downloaded}")
+              print("========================================")
+              print("")
+
 
               await client.disconnect()
 
 
+          import asyncio
+
           asyncio.run(main())
           PY
 
+
           python3 download.py
 
-          echo ""
-          echo "Downloaded files:"
-          ls -lah
+      # ============================================================
+      # 4. Detect downloaded file
+      # ============================================================
 
       - name: Detect media file
+        shell: bash
         run: |
 
-          MEDIA_FILE=$(find . -maxdepth 1 -type f \
+          MEDIA_FILE=$(find . \
+            -maxdepth 1 \
+            -type f \
             ! -name "download.py" \
             ! -name "*.log" \
             | head -n 1)
 
           if [ -z "$MEDIA_FILE" ]; then
-            echo "No downloaded media file found."
+            echo "ERROR: No media file found."
             exit 1
           fi
 
@@ -160,8 +329,6 @@ jobs:
 
           echo "Media file detected:"
           echo "$MEDIA_FILE"
-
-          echo "MEDIA_FILE=$MEDIA_FILE" >> "$GITHUB_ENV"
 
           echo ""
           echo "File information:"
@@ -171,37 +338,241 @@ jobs:
           echo "File size:"
           ls -lh "$MEDIA_FILE"
 
+          echo ""
+
+          echo "MEDIA_FILE=$MEDIA_FILE" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # 5. Inspect original media
+      # ============================================================
+
+      - name: Inspect media
+        shell: bash
+        run: |
+
+          echo "========================================"
+          echo "Original media information"
+          echo "========================================"
+
+          ffprobe \
+            -hide_banner \
+            "$MEDIA_FILE" \
+            || true
+
+      # ============================================================
+      # 6. Convert container MKV -> MP4
+      #    WITHOUT re-encoding
+      # ============================================================
+
+      - name: Convert to MP4
+        shell: bash
+        run: |
+
+          INPUT="$MEDIA_FILE"
+          OUTPUT="${INPUT%.*}.mp4"
+
+          echo ""
+          echo "========================================"
+          echo "Preparing MP4"
+          echo "========================================"
+          echo "Input : $INPUT"
+          echo "Output: $OUTPUT"
+          echo ""
+
+          # ----------------------------------------------------------
+          # Get duration
+          # ----------------------------------------------------------
+
+          DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$INPUT")
+
+          if [ -z "$DURATION" ]; then
+            echo "ERROR: Could not determine duration."
+            exit 1
+          fi
+
+          echo "Duration: ${DURATION}s"
+          echo ""
+
+          echo "Mode: COPY"
+          echo "No video re-encoding."
+          echo "No audio re-encoding."
+          echo ""
+
+          echo "Converting MKV -> MP4..."
+          echo ""
+
+          # ----------------------------------------------------------
+          # Remux using stream copy
+          # ----------------------------------------------------------
+
+          ffmpeg \
+            -hide_banner \
+            -progress pipe:1 \
+            -nostats \
+            -i "$INPUT" \
+            -map 0 \
+            -c copy \
+            -movflags +faststart \
+            -y "$OUTPUT" 2>&1 |
+          while IFS= read -r line; do
+
+              case "$line" in
+
+                  out_time_us=*)
+
+                      TIME_US="${line#out_time_us=}"
+
+                      if [ "$TIME_US" != "N/A" ]; then
+
+                          TIME_SEC=$(awk \
+                            -v x="$TIME_US" \
+                            'BEGIN {print x/1000000}')
+
+                          PERCENT=$(awk \
+                            -v t="$TIME_SEC" \
+                            -v d="$DURATION" \
+                            'BEGIN {
+                              if (d > 0)
+                                printf "%.1f", (t/d)*100
+                              else
+                                print "0"
+                            }')
+
+                          CURRENT=$(awk \
+                            -v t="$TIME_SEC" \
+                            'BEGIN {
+                              h=int(t/3600)
+                              m=int((t%3600)/60)
+                              s=int(t%60)
+                              printf "%02d:%02d:%02d",h,m,s
+                            }')
+
+                          TOTAL=$(awk \
+                            -v d="$DURATION" \
+                            'BEGIN {
+                              h=int(d/3600)
+                              m=int((d%3600)/60)
+                              s=int(d%60)
+                              printf "%02d:%02d:%02d",h,m,s
+                            }')
+
+                          echo \
+                            "[${PERCENT}%] " \
+                            "${CURRENT} / ${TOTAL}"
+
+                      fi
+
+                      ;;
+
+                  progress=end)
+                      echo ""
+                      echo "MP4 processing finished."
+                      ;;
+
+              esac
+
+          done
+
+          # ----------------------------------------------------------
+          # Verify output
+          # ----------------------------------------------------------
+
+          if [ ! -f "$OUTPUT" ]; then
+              echo "ERROR: MP4 file was not created."
+              exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "MP4 created successfully"
+          echo "========================================"
+
+          echo "Output:"
+          echo "$OUTPUT"
+
+          echo ""
+          echo "Size:"
+          ls -lh "$OUTPUT"
+
+          echo ""
+          echo "MP4 information:"
+          ffprobe \
+            -hide_banner \
+            "$OUTPUT" \
+            || true
+
+          # ----------------------------------------------------------
+          # Use MP4 for the server
+          # ----------------------------------------------------------
+
+          echo "MEDIA_FILE=$OUTPUT" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # 7. Create HTTP streaming server
+      # ============================================================
+
       - name: Create streaming server
+        shell: bash
         run: |
 
           cat > server.py <<'PY'
-          from fastapi import FastAPI, Request
-          from fastapi.responses import StreamingResponse, Response
           import os
           import mimetypes
+
+          from fastapi import FastAPI, Request
+          from fastapi.responses import StreamingResponse, Response
 
 
           app = FastAPI()
 
+
           VIDEO = os.environ["MEDIA_FILE"]
 
-          file_size = os.path.getsize(VIDEO)
 
-          mime_type, _ = mimetypes.guess_type(VIDEO)
+          if not os.path.isfile(VIDEO):
+              raise RuntimeError(
+                  f"Media file not found: {VIDEO}"
+              )
 
-          if not mime_type:
-              mime_type = "application/octet-stream"
+
+          FILE_SIZE = os.path.getsize(VIDEO)
+
+
+          MIME_TYPE, _ = mimetypes.guess_type(VIDEO)
+
+
+          if not MIME_TYPE:
+              MIME_TYPE = "application/octet-stream"
 
 
           @app.get("/")
-          async def home():
+          async def root():
 
               return {
                   "status": "online",
                   "file": os.path.basename(VIDEO),
-                  "size": file_size,
-                  "stream": "/media"
+                  "size": FILE_SIZE,
+                  "mime": MIME_TYPE
               }
+
+
+          @app.head("/media")
+          async def media_head():
+
+              headers = {
+                  "Accept-Ranges": "bytes",
+                  "Content-Length": str(FILE_SIZE),
+                  "Content-Type": MIME_TYPE,
+              }
+
+              return Response(
+                  status_code=200,
+                  headers=headers
+              )
 
 
           @app.get("/media")
@@ -209,9 +580,14 @@ jobs:
 
               range_header = request.headers.get("range")
 
+
+              # ------------------------------------------------------
+              # Normal request without Range
+              # ------------------------------------------------------
+
               if not range_header:
 
-                  def full_file():
+                  async def stream():
 
                       with open(VIDEO, "rb") as f:
 
@@ -224,96 +600,89 @@ jobs:
 
                               yield chunk
 
+
+                  headers = {
+                      "Accept-Ranges": "bytes",
+                      "Content-Length": str(FILE_SIZE),
+                      "Content-Type": MIME_TYPE,
+                  }
+
+
                   return StreamingResponse(
-                      full_file(),
-                      media_type=mime_type,
-                      headers={
-                          "Content-Length": str(file_size),
-                          "Accept-Ranges": "bytes",
-                          "Content-Disposition": "inline"
-                      }
+                      stream(),
+                      status_code=200,
+                      headers=headers,
+                      media_type=MIME_TYPE
                   )
 
 
-              if not range_header.startswith("bytes="):
+              # ------------------------------------------------------
+              # Range request
+              # ------------------------------------------------------
 
-                  return Response(
-                      status_code=416,
-                      headers={
-                          "Content-Range":
-                              f"bytes */{file_size}"
-                      }
+              try:
+
+                  range_value = range_header.replace(
+                      "bytes=",
+                      ""
                   )
 
+                  start_str, end_str = range_value.split(
+                      "-",
+                      1
+                  )
 
-              range_value = range_header.replace(
-                  "bytes=",
-                  "",
-                  1
-              )
-
-              range_value = range_value.split(",")[0]
-
-              start_str, end_str = range_value.split("-")
-
-
-              if start_str:
 
                   start = int(start_str)
 
+
                   if end_str:
                       end = int(end_str)
+
                   else:
-                      end = file_size - 1
+                      end = FILE_SIZE - 1
 
-              else:
 
-                  suffix_length = int(end_str)
+                  if start < 0:
+                      start = 0
 
-                  if suffix_length <= 0:
+
+                  if end >= FILE_SIZE:
+                      end = FILE_SIZE - 1
+
+
+                  if start > end:
                       return Response(
                           status_code=416,
                           headers={
                               "Content-Range":
-                                  f"bytes */{file_size}"
+                                  f"bytes */{FILE_SIZE}"
                           }
                       )
 
-                  suffix_length = min(
-                      suffix_length,
-                      file_size
-                  )
 
-                  start = file_size - suffix_length
-                  end = file_size - 1
-
-
-              if start >= file_size or start > end:
+              except Exception:
 
                   return Response(
                       status_code=416,
                       headers={
                           "Content-Range":
-                              f"bytes */{file_size}"
+                              f"bytes */{FILE_SIZE}"
                       }
                   )
 
 
-              end = min(
-                  end,
-                  file_size - 1
-              )
-
               content_length = end - start + 1
 
 
-              def range_file():
+              async def range_stream():
 
                   with open(VIDEO, "rb") as f:
 
                       f.seek(start)
 
                       remaining = content_length
+
 
                       while remaining > 0:
 
@@ -324,31 +693,31 @@ jobs:
 
                           chunk = f.read(chunk_size)
 
+
                           if not chunk:
                               break
 
-                          yield chunk
 
                           remaining -= len(chunk)
 
+                          yield chunk
+
+
+              headers = {
+                  "Accept-Ranges": "bytes",
+                  "Content-Range":
+                      f"bytes {start}-{end}/{FILE_SIZE}",
+                  "Content-Length":
+                      str(content_length),
+                  "Content-Type": MIME_TYPE,
+              }
+
 
               return StreamingResponse(
-                  range_file(),
+                  range_stream(),
                   status_code=206,
-                  media_type=mime_type,
-                  headers={
-                      "Content-Length":
-                          str(content_length),
-
-                      "Content-Range":
-                          f"bytes {start}-{end}/{file_size}",
-
-                      "Accept-Ranges":
-                          "bytes",
-
-                      "Content-Disposition":
-                          "inline"
-                  }
+                  headers=headers,
+                  media_type=MIME_TYPE
               )
 
 
@@ -363,13 +732,33 @@ jobs:
               )
           PY
 
-          nohup python3 server.py > server.log 2>&1 &
+      # ============================================================
+      # 8. Start server
+      # ============================================================
+
+      - name: Start streaming server
+        shell: bash
+        run: |
+
+          nohup python3 server.py \
+            > server.log 2>&1 &
 
           sleep 3
 
-          echo "Server started."
+          echo "========================================"
+          echo "Streaming server started"
+          echo "========================================"
 
-      - name: Start Cloudflare Tunnel
+          curl -I \
+            http://127.0.0.1:8080/media \
+            || true
+
+      # ============================================================
+      # 9. Start Cloudflare Quick Tunnel
+      # ============================================================
+
+      - name: Start Cloudflare tunnel
+        shell: bash
         run: |
 
           nohup cloudflared tunnel \
@@ -377,68 +766,77 @@ jobs:
             --no-autoupdate \
             > cloudflared.log 2>&1 &
 
-          echo "Waiting for tunnel..."
+          echo "Waiting for Cloudflare tunnel..."
 
           URL=""
 
           for i in {1..30}; do
 
-            URL=$(grep -oE \
-              'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
-              cloudflared.log \
-              | head -n 1)
+              URL=$(grep -o \
+                'https://[-a-zA-Z0-9]*\.trycloudflare\.com' \
+                cloudflared.log \
+                | head -n 1 \
+                || true)
 
-            if [ -n "$URL" ]; then
-              break
-            fi
+              if [ -n "$URL" ]; then
+                  break
+              fi
 
-            sleep 2
+              sleep 2
 
           done
+
 
           if [ -z "$URL" ]; then
 
-            echo "Could not get Cloudflare URL."
+              echo "ERROR: Could not get Cloudflare URL."
 
-            cat cloudflared.log
+              echo ""
+              echo "Cloudflare log:"
+              cat cloudflared.log
 
-            exit 1
-
+              exit 1
           fi
+
 
           STREAM_URL="${URL}/media"
 
-          echo ""
-          echo "=========================================="
-          echo "       TELEGRAM TEMPORARY STREAM"
-          echo "=========================================="
-          echo ""
-          echo "File:"
-          echo "$MEDIA_FILE"
-          echo ""
-          echo "Stream URL:"
-          echo "$STREAM_URL"
-          echo ""
-          echo "VLC:"
-          echo "$STREAM_URL"
-          echo ""
-          echo "=========================================="
 
-          echo "STREAM_URL=$STREAM_URL" >> "$GITHUB_ENV"
+          echo ""
+          echo "========================================"
+          echo "STREAM READY"
+          echo "========================================"
+          echo ""
+          echo "Cloudflare:"
+          echo "$URL"
+          echo ""
+          echo "Media URL:"
+          echo "$STREAM_URL"
+          echo ""
+          echo "Open this URL in VLC or your browser."
+          echo ""
+          echo "========================================"
+
+      # ============================================================
+      # 10. Keep workflow alive
+      # ============================================================
 
       - name: Keep stream alive
+        shell: bash
         run: |
 
-          echo "Stream is now available:"
-          echo "$STREAM_URL"
-
           echo ""
-          echo "Waiting for 30 minutes..."
+          echo "Stream will remain active for 30 minutes."
+          echo ""
 
           for i in {1..30}; do
 
-            echo "[$i/30] Stream active..."
+              echo "[$i/30] Stream active..."
 
-            sleep 60
+              sleep 60
 
           done
+
+          echo ""
+          echo "Stream time expired."
+          echo "Stopping..."
