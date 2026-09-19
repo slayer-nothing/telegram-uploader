@@ -33,23 +33,128 @@ jobs:
       START_TIME: ${{ inputs.start_time }}
       END_TIME: ${{ inputs.end_time }}
       OUTPUT_NAME: ${{ inputs.file_name }}
+      MEDIA_FILE: input_media
+      # Number of parallel download segments (try 4 to 16)
+      DOWNLOAD_SEGMENTS: "8"
 
     steps:
 
       # ----------------------------------------
-      # 1. Install dependencies
+      # 1. Validate inputs (fail fast, before any download)
+      # ----------------------------------------
+      - name: Validate inputs
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+
+          def fail(message):
+              print(f"ERROR: {message}")
+              sys.exit(1)
+
+
+          # ---- output file name ----
+          name = os.environ["OUTPUT_NAME"]
+
+          if (
+              not name
+              or name != name.strip()
+              or len(name) > 120
+              or name[0] in "-."
+              or re.search(r'[\\/:*?"<>|\x00-\x1f]', name)
+          ):
+              fail(
+                  "Invalid file name. Do not use / \\ : * ? \" < > | "
+                  "or control characters, and do not start with '-' or '.'."
+              )
+
+
+          # ---- timestamps ----
+          time_pattern = re.compile(r"(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
+
+
+          def to_seconds(label, value):
+              m = time_pattern.fullmatch(value.strip())
+
+              if not m:
+                  fail(f"Invalid {label} time: {value} (expected HH:MM:SS)")
+
+              hours = int(m.group(1))
+              minutes = int(m.group(2))
+              seconds = float(m.group(3))
+
+              if minutes >= 60 or seconds >= 60:
+                  fail(f"Invalid {label} time: {value}")
+
+              return hours * 3600 + minutes * 60 + seconds
+
+
+          start_seconds = to_seconds("start", os.environ["START_TIME"])
+          end_seconds = to_seconds("end", os.environ["END_TIME"])
+
+          if end_seconds <= start_seconds:
+              fail("End time must be greater than start time.")
+
+          print(f"Start: {os.environ['START_TIME']}")
+          print(f"End:   {os.environ['END_TIME']}")
+          print(f"Cut duration: {end_seconds - start_seconds:.3f} seconds")
+
+
+          # ---- Telegram URL ----
+          url = os.environ["TELEGRAM_URL"].strip()
+
+          # Private channel/group: t.me/c/<id>/<msg> or t.me/c/<id>/<topic>/<msg>
+          m = re.match(r"https?://t\.me/c/(\d+)/(?:\d+/)?(\d+)", url)
+
+          if m:
+              peer = "-100" + m.group(1)
+              msg_id = m.group(2)
+          else:
+              # Public channel: t.me/<username>/<msg> (optionally /s/ or topic)
+              m = re.match(
+                  r"https?://t\.me/(?:s/)?([A-Za-z0-9_]+)/(?:\d+/)?(\d+)",
+                  url,
+              )
+
+              if not m:
+                  fail(
+                      "Invalid Telegram URL. Expected: "
+                      "https://t.me/username/message_id "
+                      "or https://t.me/c/channel_id/message_id"
+                  )
+
+              peer = m.group(1)
+              msg_id = m.group(2)
+
+          print(f"Telegram peer: {peer}")
+          print(f"Message ID: {msg_id}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"TG_PEER={peer}\n")
+              f.write(f"TG_MSG_ID={msg_id}\n")
+          PY
+
+      # ----------------------------------------
+      # 2. Install dependencies
       # ----------------------------------------
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3 python3-pip
-
-          python3 -m pip install --break-system-packages \
+          python3 -m pip install --quiet --break-system-packages \
             telethon \
             cryptg
 
+          # ffmpeg is normally preinstalled on ubuntu-latest
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+          ffmpeg -version | head -n 1
+
       # ----------------------------------------
-      # 2. Download Telegram media
+      # 3. Download Telegram media (parallel)
       # ----------------------------------------
       - name: Download Telegram media
         env:
@@ -59,35 +164,30 @@ jobs:
         run: |
 
           cat > download.py <<'PY'
+          import asyncio
+          import math
           import os
           import re
-          import asyncio
+          import time
 
           from telethon import TelegramClient
+          from telethon.errors import FloodWaitError
           from telethon.sessions import StringSession
 
 
           API_ID = int(os.environ["TELEGRAM_API_ID"])
           API_HASH = os.environ["TELEGRAM_API_HASH"]
           SESSION = os.environ["TELEGRAM_SESSION"]
-          URL = os.environ["TELEGRAM_URL"]
 
+          PEER_RAW = os.environ["TG_PEER"]
+          PEER = int(PEER_RAW) if re.fullmatch(r"-?\d+", PEER_RAW) else PEER_RAW
+          MSG_ID = int(os.environ["TG_MSG_ID"])
 
-          def parse_telegram_url(url):
-              pattern = r"https?://t\.me/(?:s/)?([^/]+)/(\d+)"
+          OUT = os.environ["MEDIA_FILE"]
+          SEGMENTS = max(1, int(os.environ.get("DOWNLOAD_SEGMENTS", "8")))
 
-              match = re.match(pattern, url)
-
-              if not match:
-                  raise ValueError(
-                      "Invalid Telegram URL. "
-                      "Expected: https://t.me/username/message_id"
-                  )
-
-              username = match.group(1)
-              message_id = int(match.group(2))
-
-              return username, message_id
+          CHUNK = 512 * 1024
+          MAX_RETRIES = 5
 
 
           def format_size(size):
@@ -100,113 +200,168 @@ jobs:
               return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
 
+          async def fast_download(client, message, path, segments):
+              size = message.document.size
+              total_chunks = math.ceil(size / CHUNK)
+              per_seg = math.ceil(total_chunks / segments)
+
+              done = 0
+              next_report = 10
+              started = time.monotonic()
+
+              # Pre-allocate the file so each segment can write at its own offset
+              with open(path, "wb") as f:
+                  f.truncate(size)
+
+              async def worker(f, first, last):
+                  nonlocal done, next_report
+
+                  cur = first
+                  attempts = 0
+
+                  while cur < last:
+                      try:
+                          async for data in client.iter_download(
+                              message.media,
+                              offset=cur * CHUNK,
+                              limit=last - cur,
+                              request_size=CHUNK,
+                              file_size=size,
+                          ):
+                              f.seek(cur * CHUNK)
+                              f.write(data)
+                              cur += 1
+                              done += len(data)
+
+                              pct = done * 100 // size
+
+                              if pct >= next_report:
+                                  elapsed = max(time.monotonic() - started, 0.001)
+                                  speed = done / elapsed / (1024 * 1024)
+                                  print(
+                                      f"Downloading: {pct}% "
+                                      f"({format_size(done)} / {format_size(size)}) "
+                                      f"- {speed:.1f} MB/s",
+                                      flush=True,
+                                  )
+                                  next_report = (pct // 10 + 1) * 10
+
+                          if cur < last:
+                              raise RuntimeError("Download stream ended early.")
+
+                      except FloodWaitError as e:
+                          print(f"FloodWait: sleeping {e.seconds}s", flush=True)
+                          await asyncio.sleep(e.seconds + 1)
+
+                      except Exception as e:
+                          attempts += 1
+
+                          if attempts > MAX_RETRIES:
+                              raise
+
+                          print(
+                              f"Segment error ({e!r}), "
+                              f"retry {attempts}/{MAX_RETRIES}",
+                              flush=True,
+                          )
+                          await asyncio.sleep(2 * attempts)
+
+              with open(path, "r+b") as f:
+                  tasks = [
+                      asyncio.create_task(
+                          worker(
+                              f,
+                              i * per_seg,
+                              min((i + 1) * per_seg, total_chunks),
+                          )
+                      )
+                      for i in range(segments)
+                      if i * per_seg < total_chunks
+                  ]
+
+                  try:
+                      await asyncio.gather(*tasks)
+                  except BaseException:
+                      for t in tasks:
+                          t.cancel()
+                      await asyncio.gather(*tasks, return_exceptions=True)
+                      raise
+
+              if done != size:
+                  raise RuntimeError(
+                      f"Incomplete download: {done} of {size} bytes."
+                  )
+
+              elapsed = max(time.monotonic() - started, 0.001)
+              print(
+                  f"Download completed in {elapsed:.1f}s "
+                  f"(average {size / elapsed / (1024 * 1024):.1f} MB/s)"
+              )
+
+              return path
+
+
           async def main():
-
-              username, message_id = parse_telegram_url(URL)
-
-              print(f"Telegram channel: {username}")
-              print(f"Message ID: {message_id}")
-              print()
-
               client = TelegramClient(
                   StringSession(SESSION),
                   API_ID,
-                  API_HASH
+                  API_HASH,
               )
 
-              await client.start()
+              # connect() instead of start(): never waits for interactive login
+              await client.connect()
 
-              print("Connected to Telegram.")
-              print("Getting message...")
-
-              message = await client.get_messages(
-                  username,
-                  ids=message_id
-              )
-
-              if not message:
-                  raise RuntimeError("Telegram message not found.")
-
-              if not message.media:
-                  raise RuntimeError("This message does not contain media.")
-
-              filename = "telegram_input"
-
-              if message.file:
-                  original_name = message.file.name
-
-                  if original_name:
-                      filename = original_name
-
-              print(f"Original file: {filename}")
-
-              total_size = 0
-
-              if message.file:
-                  total_size = message.file.size or 0
-
-              if total_size:
-                  print(f"File size: {format_size(total_size)}")
-
-              print()
-              print("Starting download...")
-
-              last_percent = -1
-
-              def progress(current, total):
-
-                  nonlocal last_percent
-
-                  if total:
-
-                      percent = int(
-                          current * 100 / total
+              try:
+                  if not await client.is_user_authorized():
+                      raise RuntimeError(
+                          "TELEGRAM_SESSION is invalid or expired. "
+                          "Generate a new session string."
                       )
 
-                      if percent != last_percent:
-                          last_percent = percent
+                  print("Connected to Telegram.")
 
-                          print(
-                              f"\rDownloading: "
-                              f"{percent}% "
-                              f"({format_size(current)} / "
-                              f"{format_size(total)})",
-                              end="",
-                              flush=True
-                          )
+                  # Private channels need the entity cache to be populated
+                  if isinstance(PEER, int):
+                      await client.get_dialogs()
 
-              downloaded = await client.download_media(
-                  message,
-                  file=filename,
-                  progress_callback=progress
-              )
+                  print("Getting message...")
 
-              print()
+                  message = await client.get_messages(PEER, ids=MSG_ID)
 
-              if not downloaded:
-                  raise RuntimeError(
-                      "Telegram download returned no file."
-                  )
+                  if not message:
+                      raise RuntimeError("Telegram message not found.")
 
-              downloaded = os.path.abspath(downloaded)
+                  if not message.media:
+                      raise RuntimeError("This message does not contain media.")
 
-              if not os.path.isfile(downloaded):
-                  raise RuntimeError(
-                      f"Downloaded file does not exist: {downloaded}"
-                  )
+                  original_name = message.file.name if message.file else None
+                  print(f"Original file: {original_name or '(unnamed)'}")
 
-              print()
-              print("Download completed.")
-              print(f"Downloaded file: {downloaded}")
+                  if message.document and message.document.size:
+                      print(f"File size: {format_size(message.document.size)}")
+                      print(f"Parallel segments: {SEGMENTS}")
+                      print()
+                      print("Starting download...")
 
-              with open(
-                  "downloaded_media.txt",
-                  "w",
-                  encoding="utf-8"
-              ) as f:
-                  f.write(downloaded)
+                      await fast_download(client, message, OUT, SEGMENTS)
+                  else:
+                      print("Size unknown or not a document, using normal download.")
 
-              await client.disconnect()
+                      downloaded = await client.download_media(message, file=OUT)
+
+                      if not downloaded:
+                          raise RuntimeError("Telegram download returned no file.")
+
+                      if os.path.abspath(downloaded) != os.path.abspath(OUT):
+                          os.replace(downloaded, OUT)
+
+                  if not os.path.isfile(OUT) or os.path.getsize(OUT) == 0:
+                      raise RuntimeError("Downloaded file is missing or empty.")
+
+                  print(f"Downloaded file: {os.path.abspath(OUT)}")
+
+              finally:
+                  await client.disconnect()
 
 
           asyncio.run(main())
@@ -215,34 +370,15 @@ jobs:
           python3 download.py
 
       # ----------------------------------------
-      # 3. Find downloaded file
-      # ----------------------------------------
-      - name: Detect downloaded file
-        run: |
-
-          MEDIA_FILE=$(cat downloaded_media.txt)
-
-          if [ -z "$MEDIA_FILE" ]; then
-            echo "No media file was detected."
-            exit 1
-          fi
-
-          if [ ! -f "$MEDIA_FILE" ]; then
-            echo "Media file does not exist:"
-            echo "$MEDIA_FILE"
-            exit 1
-          fi
-
-          echo "Input file:"
-          echo "$MEDIA_FILE"
-
-          echo "MEDIA_FILE=$MEDIA_FILE" >> "$GITHUB_ENV"
-
-      # ----------------------------------------
       # 4. Inspect input
       # ----------------------------------------
       - name: Inspect media
         run: |
+
+          if [ ! -s "$MEDIA_FILE" ]; then
+            echo "Media file is missing or empty: $MEDIA_FILE"
+            exit 1
+          fi
 
           echo "================================"
           echo "Input media information"
@@ -259,86 +395,7 @@ jobs:
             "$MEDIA_FILE"
 
       # ----------------------------------------
-      # 5. Validate timestamps
-      # ----------------------------------------
-      - name: Validate timestamps
-        run: |
-
-          python3 - <<'PY'
-          import os
-          import re
-          import sys
-
-
-          start = os.environ["START_TIME"]
-          end = os.environ["END_TIME"]
-
-
-          pattern = r"^\d{2}:\d{2}:\d{2}(?:\.\d+)?$"
-
-
-          if not re.match(pattern, start):
-              print(
-                  f"Invalid start time: {start}"
-              )
-              print(
-                  "Expected format: HH:MM:SS"
-              )
-              sys.exit(1)
-
-
-          if not re.match(pattern, end):
-              print(
-                  f"Invalid end time: {end}"
-              )
-              print(
-                  "Expected format: HH:MM:SS"
-              )
-              sys.exit(1)
-
-
-          def to_seconds(value):
-
-              parts = value.split(":")
-
-              hours = int(parts[0])
-              minutes = int(parts[1])
-              seconds = float(parts[2])
-
-              return (
-                  hours * 3600
-                  + minutes * 60
-                  + seconds
-              )
-
-
-          start_seconds = to_seconds(start)
-          end_seconds = to_seconds(end)
-
-
-          if start_seconds < 0:
-              print("Start time cannot be negative.")
-              sys.exit(1)
-
-
-          if end_seconds <= start_seconds:
-              print(
-                  "End time must be greater than "
-                  "start time."
-              )
-              sys.exit(1)
-
-
-          duration = end_seconds - start_seconds
-
-
-          print(f"Start: {start}")
-          print(f"End:   {end}")
-          print(f"Cut duration: {duration:.3f} seconds")
-          PY
-
-      # ----------------------------------------
-      # 6. Cut video
+      # 5. Cut video
       # ----------------------------------------
       - name: Cut selected section
         run: |
@@ -356,6 +413,7 @@ jobs:
 
           ffmpeg \
             -hide_banner \
+            -nostdin \
             -ss "$START_TIME" \
             -to "$END_TIME" \
             -i "$MEDIA_FILE" \
@@ -363,6 +421,7 @@ jobs:
             -map 0:a:0? \
             -c copy \
             -avoid_negative_ts make_zero \
+            -movflags +faststart \
             -y \
             "$OUTPUT_FILE"
 
@@ -370,15 +429,15 @@ jobs:
           echo "Cut completed."
 
       # ----------------------------------------
-      # 7. Verify output
+      # 6. Verify output
       # ----------------------------------------
       - name: Verify output
         run: |
 
           OUTPUT_FILE="${OUTPUT_NAME}.mp4"
 
-          if [ ! -f "$OUTPUT_FILE" ]; then
-            echo "Output file was not created."
+          if [ ! -s "$OUTPUT_FILE" ]; then
+            echo "Output file was not created or is empty."
             exit 1
           fi
 
@@ -399,7 +458,7 @@ jobs:
             "$OUTPUT_FILE"
 
       # ----------------------------------------
-      # 8. Upload result
+      # 7. Upload result
       # ----------------------------------------
       - name: Upload cut video
         uses: actions/upload-artifact@v4
@@ -408,19 +467,17 @@ jobs:
           path: ${{ inputs.file_name }}.mp4
           if-no-files-found: error
           retention-days: 1
+          # mp4 is already compressed; skipping zip compression is faster
+          compression-level: 0
 
       # ----------------------------------------
-      # 9. Cleanup
+      # 8. Cleanup
       # ----------------------------------------
       - name: Cleanup
         if: always()
         run: |
 
-          rm -f downloaded_media.txt
           rm -f download.py
-
-          if [ -n "${MEDIA_FILE:-}" ]; then
-            rm -f "$MEDIA_FILE"
-          fi
+          rm -f "$MEDIA_FILE"
 
           echo "Cleanup completed."
