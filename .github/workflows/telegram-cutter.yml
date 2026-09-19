@@ -34,7 +34,10 @@ jobs:
       END_TIME: ${{ inputs.end_time }}
       OUTPUT_NAME: ${{ inputs.file_name }}
       MEDIA_FILE: input_media
-      # Number of parallel download segments (try 4 to 16)
+      # Number of separate connections to the Telegram data center.
+      # 1 = single connection only (the older, slower method).
+      DOWNLOAD_CONNECTIONS: "16"
+      # Total number of parallel requests, shared between the connections.
       DOWNLOAD_SEGMENTS: "16"
 
     steps:
@@ -154,7 +157,7 @@ jobs:
           ffmpeg -version | head -n 1
 
       # ----------------------------------------
-      # 3. Download Telegram media (parallel)
+      # 3. Download Telegram media (multi-connection + parallel)
       # ----------------------------------------
       - name: Download Telegram media
         env:
@@ -174,6 +177,24 @@ jobs:
           from telethon.errors import FloodWaitError
           from telethon.sessions import StringSession
 
+          # These use Telethon internals. If anything is missing in a future
+          # Telethon version, we simply fall back to the single-connection mode.
+          try:
+              from telethon import utils
+              from telethon.network import MTProtoSender
+              from telethon.tl.alltlobjects import LAYER
+              from telethon.tl.functions import InvokeWithLayerRequest
+              from telethon.tl.functions.auth import (
+                  ExportAuthorizationRequest,
+                  ImportAuthorizationRequest,
+              )
+              from telethon.tl.functions.upload import GetFileRequest
+
+              MULTI_IMPORT_OK = True
+          except ImportError as import_error:
+              MULTI_IMPORT_OK = False
+              print(f"Multi-connection imports unavailable: {import_error!r}")
+
 
           API_ID = int(os.environ["TELEGRAM_API_ID"])
           API_HASH = os.environ["TELEGRAM_API_HASH"]
@@ -184,10 +205,15 @@ jobs:
           MSG_ID = int(os.environ["TG_MSG_ID"])
 
           OUT = os.environ["MEDIA_FILE"]
-          SEGMENTS = max(1, int(os.environ.get("DOWNLOAD_SEGMENTS", "8")))
+          SEGMENTS = max(1, int(os.environ.get("DOWNLOAD_SEGMENTS", "16")))
+          CONNECTIONS = max(1, int(os.environ.get("DOWNLOAD_CONNECTIONS", "8")))
 
           CHUNK = 512 * 1024
           MAX_RETRIES = 5
+
+
+          class Unsupported(Exception):
+              """Raised for situations that retrying will not fix."""
 
 
           def format_size(size):
@@ -200,22 +226,228 @@ jobs:
               return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
 
+          class Progress:
+
+              def __init__(self, size):
+                  self.size = size
+                  self.done = 0
+                  self.next_report = 10
+                  self.started = time.monotonic()
+
+              def add(self, amount):
+                  self.done += amount
+                  pct = self.done * 100 // self.size
+
+                  if pct >= self.next_report:
+                      elapsed = max(time.monotonic() - self.started, 0.001)
+                      speed = self.done / elapsed / (1024 * 1024)
+                      print(
+                          f"Downloading: {pct}% "
+                          f"({format_size(self.done)} / {format_size(self.size)}) "
+                          f"- {speed:.1f} MB/s",
+                          flush=True,
+                      )
+                      self.next_report = (pct // 10 + 1) * 10
+
+              def finish(self):
+                  if self.done != self.size:
+                      raise RuntimeError(
+                          f"Incomplete download: {self.done} of {self.size} bytes."
+                      )
+
+                  elapsed = max(time.monotonic() - self.started, 0.001)
+                  print(
+                      f"Download completed in {elapsed:.1f}s "
+                      f"(average {self.size / elapsed / (1024 * 1024):.1f} MB/s)"
+                  )
+
+
+          async def run_all(tasks):
+              try:
+                  await asyncio.gather(*tasks)
+              except BaseException:
+                  for t in tasks:
+                      t.cancel()
+                  await asyncio.gather(*tasks, return_exceptions=True)
+                  raise
+
+
+          # ----------------------------------------
+          # Method A: several connections to the data center
+          # ----------------------------------------
+          async def create_senders(client, dc_id, count):
+              home_dc = client.session.dc_id == dc_id
+              auth_key = client.session.auth_key if home_dc else None
+              senders = []
+
+              try:
+                  for _ in range(count):
+                      dc = await client._get_dc(dc_id)
+
+                      sender = MTProtoSender(auth_key, loggers=client._log)
+
+                      await sender.connect(
+                          client._connection(
+                              dc.ip_address,
+                              dc.port,
+                              dc.id,
+                              loggers=client._log,
+                              proxy=client._proxy,
+                          )
+                      )
+
+                      if not auth_key:
+                          # File is on another data center: authorize this
+                          # connection there. The first sender creates the key,
+                          # the rest reuse it.
+                          auth = await client(ExportAuthorizationRequest(dc_id))
+                          client._init_request.query = ImportAuthorizationRequest(
+                              id=auth.id,
+                              bytes=auth.bytes,
+                          )
+                          await sender.send(
+                              InvokeWithLayerRequest(LAYER, client._init_request)
+                          )
+                          auth_key = sender.auth_key
+
+                      senders.append(sender)
+
+              except BaseException:
+                  await asyncio.gather(
+                      *[s.disconnect() for s in senders],
+                      return_exceptions=True,
+                  )
+                  raise
+
+              return senders
+
+
+          async def multi_download(client, message, path, workers, connections):
+              document = message.document
+              size = document.size
+
+              dc_id, location = utils.get_input_location(document)
+              dc_id = dc_id or document.dc_id
+
+              total_chunks = math.ceil(size / CHUNK)
+              workers = max(1, min(workers, total_chunks))
+              connections = max(1, min(connections, workers))
+
+              print(f"Opening {connections} connection(s) to DC {dc_id}...")
+              senders = await create_senders(client, dc_id, connections)
+              print(f"Connections ready. Parallel requests: {workers}")
+              print()
+
+              try:
+                  progress = Progress(size)
+
+                  queue = asyncio.Queue()
+                  for index in range(total_chunks):
+                      queue.put_nowait(index)
+
+                  with open(path, "wb") as f:
+                      f.truncate(size)
+
+                  async def worker(f, sender):
+                      while True:
+                          try:
+                              index = queue.get_nowait()
+                          except asyncio.QueueEmpty:
+                              return
+
+                          offset = index * CHUNK
+                          expected = min(CHUNK, size - offset)
+                          attempts = 0
+
+                          while True:
+                              try:
+                                  result = await client._call(
+                                      sender,
+                                      GetFileRequest(
+                                          location,
+                                          offset=offset,
+                                          limit=CHUNK,
+                                      ),
+                                  )
+
+                                  data = getattr(result, "bytes", None)
+
+                                  if data is None:
+                                      raise Unsupported(
+                                          "Unexpected getFile result "
+                                          "(CDN redirect?)."
+                                      )
+
+                                  if len(data) != expected:
+                                      raise RuntimeError(
+                                          f"Chunk {index}: got {len(data)} "
+                                          f"bytes, expected {expected}."
+                                      )
+
+                                  f.seek(offset)
+                                  f.write(data)
+                                  progress.add(len(data))
+                                  break
+
+                              except Unsupported:
+                                  raise
+
+                              except FloodWaitError as e:
+                                  print(
+                                      f"FloodWait: sleeping {e.seconds}s",
+                                      flush=True,
+                                  )
+                                  await asyncio.sleep(e.seconds + 1)
+
+                              except Exception as e:
+                                  attempts += 1
+
+                                  if attempts > MAX_RETRIES:
+                                      raise
+
+                                  print(
+                                      f"Chunk error ({e!r}), "
+                                      f"retry {attempts}/{MAX_RETRIES}",
+                                      flush=True,
+                                  )
+                                  await asyncio.sleep(2 * attempts)
+
+                  with open(path, "r+b") as f:
+                      await run_all([
+                          asyncio.create_task(
+                              worker(f, senders[i % len(senders)])
+                          )
+                          for i in range(workers)
+                      ])
+
+                  progress.finish()
+
+              finally:
+                  await asyncio.gather(
+                      *[s.disconnect() for s in senders],
+                      return_exceptions=True,
+                  )
+
+              return path
+
+
+          # ----------------------------------------
+          # Method B: one connection, many parallel requests
+          # (used as fallback)
+          # ----------------------------------------
           async def fast_download(client, message, path, segments):
               size = message.document.size
               total_chunks = math.ceil(size / CHUNK)
+              segments = max(1, min(segments, total_chunks))
               per_seg = math.ceil(total_chunks / segments)
 
-              done = 0
-              next_report = 10
-              started = time.monotonic()
+              progress = Progress(size)
 
               # Pre-allocate the file so each segment can write at its own offset
               with open(path, "wb") as f:
                   f.truncate(size)
 
               async def worker(f, first, last):
-                  nonlocal done, next_report
-
                   cur = first
                   attempts = 0
 
@@ -231,20 +463,7 @@ jobs:
                               f.seek(cur * CHUNK)
                               f.write(data)
                               cur += 1
-                              done += len(data)
-
-                              pct = done * 100 // size
-
-                              if pct >= next_report:
-                                  elapsed = max(time.monotonic() - started, 0.001)
-                                  speed = done / elapsed / (1024 * 1024)
-                                  print(
-                                      f"Downloading: {pct}% "
-                                      f"({format_size(done)} / {format_size(size)}) "
-                                      f"- {speed:.1f} MB/s",
-                                      flush=True,
-                                  )
-                                  next_report = (pct // 10 + 1) * 10
+                              progress.add(len(data))
 
                           if cur < last:
                               raise RuntimeError("Download stream ended early.")
@@ -267,7 +486,7 @@ jobs:
                           await asyncio.sleep(2 * attempts)
 
               with open(path, "r+b") as f:
-                  tasks = [
+                  await run_all([
                       asyncio.create_task(
                           worker(
                               f,
@@ -277,26 +496,9 @@ jobs:
                       )
                       for i in range(segments)
                       if i * per_seg < total_chunks
-                  ]
+                  ])
 
-                  try:
-                      await asyncio.gather(*tasks)
-                  except BaseException:
-                      for t in tasks:
-                          t.cancel()
-                      await asyncio.gather(*tasks, return_exceptions=True)
-                      raise
-
-              if done != size:
-                  raise RuntimeError(
-                      f"Incomplete download: {done} of {size} bytes."
-                  )
-
-              elapsed = max(time.monotonic() - started, 0.001)
-              print(
-                  f"Download completed in {elapsed:.1f}s "
-                  f"(average {size / elapsed / (1024 * 1024):.1f} MB/s)"
-              )
+              progress.finish()
 
               return path
 
@@ -339,11 +541,33 @@ jobs:
 
                   if message.document and message.document.size:
                       print(f"File size: {format_size(message.document.size)}")
-                      print(f"Parallel segments: {SEGMENTS}")
                       print()
-                      print("Starting download...")
 
-                      await fast_download(client, message, OUT, SEGMENTS)
+                      done = False
+
+                      if CONNECTIONS > 1 and MULTI_IMPORT_OK:
+                          print("Mode: multi-connection")
+
+                          try:
+                              await multi_download(
+                                  client,
+                                  message,
+                                  OUT,
+                                  SEGMENTS,
+                                  CONNECTIONS,
+                              )
+                              done = True
+
+                          except Exception as e:
+                              print()
+                              print(f"Multi-connection download failed: {e!r}")
+                              print("Falling back to single-connection mode.")
+                              print()
+
+                      if not done:
+                          print(f"Mode: single connection, {SEGMENTS} segments")
+                          await fast_download(client, message, OUT, SEGMENTS)
+
                   else:
                       print("Size unknown or not a document, using normal download.")
 
@@ -364,7 +588,8 @@ jobs:
                   await client.disconnect()
 
 
-          asyncio.run(main())
+          if __name__ == "__main__":
+              asyncio.run(main())
           PY
 
           python3 download.py
