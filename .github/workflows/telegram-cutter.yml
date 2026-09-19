@@ -1,0 +1,426 @@
+name: Telegram Video Cutter
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_url:
+        description: "Telegram message URL"
+        required: true
+        type: string
+
+      start_time:
+        description: "Start time (HH:MM:SS)"
+        required: true
+        type: string
+
+      end_time:
+        description: "End time (HH:MM:SS)"
+        required: true
+        type: string
+
+      file_name:
+        description: "Output file name without extension"
+        required: true
+        type: string
+
+jobs:
+  cut-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      TELEGRAM_URL: ${{ inputs.telegram_url }}
+      START_TIME: ${{ inputs.start_time }}
+      END_TIME: ${{ inputs.end_time }}
+      OUTPUT_NAME: ${{ inputs.file_name }}
+
+    steps:
+
+      # ----------------------------------------
+      # 1. Install dependencies
+      # ----------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3 python3-pip
+
+          python3 -m pip install --break-system-packages \
+            telethon \
+            cryptg
+
+      # ----------------------------------------
+      # 2. Download Telegram media
+      # ----------------------------------------
+      - name: Download Telegram media
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+        run: |
+
+          cat > download.py <<'PY'
+          import os
+          import re
+          import asyncio
+
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+
+          API_ID = int(os.environ["TELEGRAM_API_ID"])
+          API_HASH = os.environ["TELEGRAM_API_HASH"]
+          SESSION = os.environ["TELEGRAM_SESSION"]
+          URL = os.environ["TELEGRAM_URL"]
+
+
+          def parse_telegram_url(url):
+              pattern = r"https?://t\.me/(?:s/)?([^/]+)/(\d+)"
+
+              match = re.match(pattern, url)
+
+              if not match:
+                  raise ValueError(
+                      "Invalid Telegram URL. "
+                      "Expected: https://t.me/username/message_id"
+                  )
+
+              username = match.group(1)
+              message_id = int(match.group(2))
+
+              return username, message_id
+
+
+          def format_size(size):
+              if size < 1024 * 1024:
+                  return f"{size / 1024:.1f} KB"
+
+              if size < 1024 * 1024 * 1024:
+                  return f"{size / (1024 * 1024):.2f} MB"
+
+              return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+
+          async def main():
+
+              username, message_id = parse_telegram_url(URL)
+
+              print(f"Telegram channel: {username}")
+              print(f"Message ID: {message_id}")
+              print()
+
+              client = TelegramClient(
+                  StringSession(SESSION),
+                  API_ID,
+                  API_HASH
+              )
+
+              await client.start()
+
+              print("Connected to Telegram.")
+              print("Getting message...")
+
+              message = await client.get_messages(
+                  username,
+                  ids=message_id
+              )
+
+              if not message:
+                  raise RuntimeError("Telegram message not found.")
+
+              if not message.media:
+                  raise RuntimeError("This message does not contain media.")
+
+              filename = "telegram_input"
+
+              if message.file:
+                  original_name = message.file.name
+
+                  if original_name:
+                      filename = original_name
+
+              print(f"Original file: {filename}")
+
+              total_size = 0
+
+              if message.file:
+                  total_size = message.file.size or 0
+
+              if total_size:
+                  print(f"File size: {format_size(total_size)}")
+
+              print()
+              print("Starting download...")
+
+              last_percent = -1
+
+              def progress(current, total):
+
+                  nonlocal last_percent
+
+                  if total:
+
+                      percent = int(
+                          current * 100 / total
+                      )
+
+                      if percent != last_percent:
+                          last_percent = percent
+
+                          print(
+                              f"\rDownloading: "
+                              f"{percent}% "
+                              f"({format_size(current)} / "
+                              f"{format_size(total)})",
+                              end="",
+                              flush=True
+                          )
+
+              downloaded = await client.download_media(
+                  message,
+                  file=filename,
+                  progress_callback=progress
+              )
+
+              print()
+
+              if not downloaded:
+                  raise RuntimeError(
+                      "Telegram download returned no file."
+                  )
+
+              downloaded = os.path.abspath(downloaded)
+
+              if not os.path.isfile(downloaded):
+                  raise RuntimeError(
+                      f"Downloaded file does not exist: {downloaded}"
+                  )
+
+              print()
+              print("Download completed.")
+              print(f"Downloaded file: {downloaded}")
+
+              with open(
+                  "downloaded_media.txt",
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  f.write(downloaded)
+
+              await client.disconnect()
+
+
+          asyncio.run(main())
+          PY
+
+          python3 download.py
+
+      # ----------------------------------------
+      # 3. Find downloaded file
+      # ----------------------------------------
+      - name: Detect downloaded file
+        run: |
+
+          MEDIA_FILE=$(cat downloaded_media.txt)
+
+          if [ -z "$MEDIA_FILE" ]; then
+            echo "No media file was detected."
+            exit 1
+          fi
+
+          if [ ! -f "$MEDIA_FILE" ]; then
+            echo "Media file does not exist:"
+            echo "$MEDIA_FILE"
+            exit 1
+          fi
+
+          echo "Input file:"
+          echo "$MEDIA_FILE"
+
+          echo "MEDIA_FILE=$MEDIA_FILE" >> "$GITHUB_ENV"
+
+      # ----------------------------------------
+      # 4. Inspect input
+      # ----------------------------------------
+      - name: Inspect media
+        run: |
+
+          echo "================================"
+          echo "Input media information"
+          echo "================================"
+
+          ffprobe \
+            -hide_banner \
+            -v error \
+            -show_entries \
+            format=duration,size,format_name \
+            -show_entries \
+            stream=index,codec_name,codec_type,width,height,r_frame_rate \
+            -of default=noprint_wrappers=1 \
+            "$MEDIA_FILE"
+
+      # ----------------------------------------
+      # 5. Validate timestamps
+      # ----------------------------------------
+      - name: Validate timestamps
+        run: |
+
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+
+          start = os.environ["START_TIME"]
+          end = os.environ["END_TIME"]
+
+
+          pattern = r"^\d{2}:\d{2}:\d{2}(?:\.\d+)?$"
+
+
+          if not re.match(pattern, start):
+              print(
+                  f"Invalid start time: {start}"
+              )
+              print(
+                  "Expected format: HH:MM:SS"
+              )
+              sys.exit(1)
+
+
+          if not re.match(pattern, end):
+              print(
+                  f"Invalid end time: {end}"
+              )
+              print(
+                  "Expected format: HH:MM:SS"
+              )
+              sys.exit(1)
+
+
+          def to_seconds(value):
+
+              parts = value.split(":")
+
+              hours = int(parts[0])
+              minutes = int(parts[1])
+              seconds = float(parts[2])
+
+              return (
+                  hours * 3600
+                  + minutes * 60
+                  + seconds
+              )
+
+
+          start_seconds = to_seconds(start)
+          end_seconds = to_seconds(end)
+
+
+          if start_seconds < 0:
+              print("Start time cannot be negative.")
+              sys.exit(1)
+
+
+          if end_seconds <= start_seconds:
+              print(
+                  "End time must be greater than "
+                  "start time."
+              )
+              sys.exit(1)
+
+
+          duration = end_seconds - start_seconds
+
+
+          print(f"Start: {start}")
+          print(f"End:   {end}")
+          print(f"Cut duration: {duration:.3f} seconds")
+          PY
+
+      # ----------------------------------------
+      # 6. Cut video
+      # ----------------------------------------
+      - name: Cut selected section
+        run: |
+
+          OUTPUT_FILE="${OUTPUT_NAME}.mp4"
+
+          echo "================================"
+          echo "Cutting video"
+          echo "================================"
+
+          echo "Start: $START_TIME"
+          echo "End:   $END_TIME"
+          echo "Output: $OUTPUT_FILE"
+          echo
+
+          ffmpeg \
+            -hide_banner \
+            -ss "$START_TIME" \
+            -to "$END_TIME" \
+            -i "$MEDIA_FILE" \
+            -map 0:v:0 \
+            -map 0:a:0? \
+            -c copy \
+            -avoid_negative_ts make_zero \
+            -y \
+            "$OUTPUT_FILE"
+
+          echo
+          echo "Cut completed."
+
+      # ----------------------------------------
+      # 7. Verify output
+      # ----------------------------------------
+      - name: Verify output
+        run: |
+
+          OUTPUT_FILE="${OUTPUT_NAME}.mp4"
+
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "Output file was not created."
+            exit 1
+          fi
+
+          echo "================================"
+          echo "Output information"
+          echo "================================"
+
+          ls -lh "$OUTPUT_FILE"
+
+          ffprobe \
+            -hide_banner \
+            -v error \
+            -show_entries \
+            format=duration,size,format_name \
+            -show_entries \
+            stream=index,codec_name,codec_type,width,height \
+            -of default=noprint_wrappers=1 \
+            "$OUTPUT_FILE"
+
+      # ----------------------------------------
+      # 8. Upload result
+      # ----------------------------------------
+      - name: Upload cut video
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.file_name }}
+          path: ${{ inputs.file_name }}.mp4
+          if-no-files-found: error
+          retention-days: 1
+
+      # ----------------------------------------
+      # 9. Cleanup
+      # ----------------------------------------
+      - name: Cleanup
+        if: always()
+        run: |
+
+          rm -f downloaded_media.txt
+          rm -f download.py
+
+          if [ -n "${MEDIA_FILE:-}" ]; then
+            rm -f "$MEDIA_FILE"
+          fi
+
+          echo "Cleanup completed."
