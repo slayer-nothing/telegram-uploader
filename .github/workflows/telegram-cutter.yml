@@ -23,6 +23,12 @@ on:
         required: true
         type: string
 
+      more_cuts:
+        description: "Optional extra cuts from the same video: start,end,name; start,end,name"
+        required: false
+        default: ""
+        type: string
+
 jobs:
   cut-video:
     runs-on: ubuntu-latest
@@ -33,10 +39,11 @@ jobs:
       START_TIME: ${{ inputs.start_time }}
       END_TIME: ${{ inputs.end_time }}
       OUTPUT_NAME: ${{ inputs.file_name }}
+      MORE_CUTS: ${{ inputs.more_cuts }}
       MEDIA_FILE: input_media
       # Number of separate connections to the Telegram data center.
       # 1 = single connection only (the older, slower method).
-      DOWNLOAD_CONNECTIONS: "16"
+      DOWNLOAD_CONNECTIONS: "8"
       # Total number of parallel requests, shared between the connections.
       DOWNLOAD_SEGMENTS: "16"
 
@@ -58,28 +65,27 @@ jobs:
               sys.exit(1)
 
 
-          # ---- output file name ----
-          name = os.environ["OUTPUT_NAME"]
+          # ---- helpers ----
+          def check_name(name):
+              if (
+                  not name
+                  or name != name.strip()
+                  or len(name) > 120
+                  or name[0] in "-."
+                  or re.search(r'[\\/:*?"<>|,;\x00-\x1f]', name)
+              ):
+                  fail(
+                      f"Invalid file name: {name!r}. "
+                      "Do not use / \\ : * ? \" < > | , ; or control "
+                      "characters, and do not start with '-' or '.'."
+                  )
 
-          if (
-              not name
-              or name != name.strip()
-              or len(name) > 120
-              or name[0] in "-."
-              or re.search(r'[\\/:*?"<>|\x00-\x1f]', name)
-          ):
-              fail(
-                  "Invalid file name. Do not use / \\ : * ? \" < > | "
-                  "or control characters, and do not start with '-' or '.'."
-              )
 
-
-          # ---- timestamps ----
           time_pattern = re.compile(r"(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
 
 
           def to_seconds(label, value):
-              m = time_pattern.fullmatch(value.strip())
+              m = time_pattern.fullmatch(value)
 
               if not m:
                   fail(f"Invalid {label} time: {value} (expected HH:MM:SS)")
@@ -94,15 +100,70 @@ jobs:
               return hours * 3600 + minutes * 60 + seconds
 
 
-          start_seconds = to_seconds("start", os.environ["START_TIME"])
-          end_seconds = to_seconds("end", os.environ["END_TIME"])
+          # ---- collect all cuts: the main one + optional extras ----
+          cuts = [(
+              os.environ["START_TIME"].strip(),
+              os.environ["END_TIME"].strip(),
+              os.environ["OUTPUT_NAME"],
+          )]
 
-          if end_seconds <= start_seconds:
-              fail("End time must be greater than start time.")
+          for part in re.split(r"[;\n]", os.environ.get("MORE_CUTS", "")):
+              part = part.strip()
 
-          print(f"Start: {os.environ['START_TIME']}")
-          print(f"End:   {os.environ['END_TIME']}")
-          print(f"Cut duration: {end_seconds - start_seconds:.3f} seconds")
+              if not part:
+                  continue
+
+              fields = [x.strip() for x in part.split(",")]
+
+              if len(fields) != 3:
+                  fail(
+                      f"Invalid extra cut: {part!r}. "
+                      "Expected: start,end,name"
+                  )
+
+              cuts.append((fields[0], fields[1], fields[2]))
+
+          if len(cuts) > 30:
+              fail("Too many cuts (maximum 30).")
+
+          seen = set()
+          lines = []
+
+          print(f"Cuts: {len(cuts)}")
+
+          for number, (start, end, name) in enumerate(cuts, start=1):
+              check_name(name)
+
+              if name.lower() in seen:
+                  fail(f"Duplicate file name: {name}")
+
+              seen.add(name.lower())
+
+              start_seconds = to_seconds(f"start (cut {number})", start)
+              end_seconds = to_seconds(f"end (cut {number})", end)
+
+              if end_seconds <= start_seconds:
+                  fail(
+                      f"Cut {number}: end time must be greater "
+                      "than start time."
+                  )
+
+              print(
+                  f"  {number}. {start} -> {end} "
+                  f"({end_seconds - start_seconds:.3f}s)  {name}.mp4"
+              )
+
+              lines.append(f"{start}\t{end}\t{name}\n")
+
+          with open("cuts.txt", "w", encoding="utf-8") as f:
+              f.writelines(lines)
+
+          first_name = cuts[0][2]
+
+          if len(cuts) == 1:
+              artifact_name = first_name
+          else:
+              artifact_name = f"{first_name}_and_{len(cuts) - 1}_more"
 
 
           # ---- Telegram URL ----
@@ -137,6 +198,7 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"TG_PEER={peer}\n")
               f.write(f"TG_MSG_ID={msg_id}\n")
+              f.write(f"ARTIFACT_NAME={artifact_name}\n")
           PY
 
       # ----------------------------------------
@@ -620,38 +682,82 @@ jobs:
             "$MEDIA_FILE"
 
       # ----------------------------------------
-      # 5. Cut video
+      # 5. Cut videos (every cut comes from the one downloaded file)
       # ----------------------------------------
-      - name: Cut selected section
+      - name: Cut selected sections
         run: |
 
-          OUTPUT_FILE="${OUTPUT_NAME}.mp4"
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MEDIA_FILE" || true)
 
-          echo "================================"
-          echo "Cutting video"
-          echo "================================"
+          python3 - "$DURATION" <<'PY'
+          import sys
 
-          echo "Start: $START_TIME"
-          echo "End:   $END_TIME"
-          echo "Output: $OUTPUT_FILE"
-          echo
+          try:
+              duration = float(sys.argv[1])
+          except ValueError:
+              print("Could not read the video duration, skipping range check.")
+              sys.exit(0)
 
-          ffmpeg \
-            -hide_banner \
-            -nostdin \
-            -ss "$START_TIME" \
-            -to "$END_TIME" \
-            -i "$MEDIA_FILE" \
-            -map 0:v:0 \
-            -map 0:a:0? \
-            -c copy \
-            -avoid_negative_ts make_zero \
-            -movflags +faststart \
-            -y \
-            "$OUTPUT_FILE"
 
-          echo
-          echo "Cut completed."
+          def to_seconds(value):
+              h, m, s = value.split(":")
+              return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+          print(f"Video duration: {duration:.3f} seconds")
+
+          with open("cuts.txt", encoding="utf-8") as f:
+              for line in f:
+                  start, end, name = line.rstrip("\n").split("\t")
+
+                  if to_seconds(start) >= duration:
+                      print(
+                          f"ERROR: start of '{name}' ({start}) "
+                          "is beyond the end of the video."
+                      )
+                      sys.exit(1)
+
+                  if to_seconds(end) > duration:
+                      print(
+                          f"WARNING: end of '{name}' ({end}) is after the "
+                          "end of the video, it will be cut at the end."
+                      )
+          PY
+
+          mkdir -p out
+
+          while IFS=$'\t' read -r START END NAME; do
+
+            OUTPUT_FILE="out/${NAME}.mp4"
+
+            echo "================================"
+            echo "Cutting: $NAME"
+            echo "================================"
+
+            echo "Start: $START"
+            echo "End:   $END"
+            echo "Output: $OUTPUT_FILE"
+            echo
+
+            ffmpeg \
+              -hide_banner \
+              -nostdin \
+              -ss "$START" \
+              -to "$END" \
+              -i "$MEDIA_FILE" \
+              -map 0:v:0 \
+              -map 0:a:0? \
+              -c copy \
+              -avoid_negative_ts make_zero \
+              -movflags +faststart \
+              -y \
+              "$OUTPUT_FILE"
+
+            echo
+
+          done < cuts.txt
+
+          echo "All cuts completed."
 
       # ----------------------------------------
       # 6. Verify output
@@ -659,37 +765,43 @@ jobs:
       - name: Verify output
         run: |
 
-          OUTPUT_FILE="${OUTPUT_NAME}.mp4"
+          while IFS=$'\t' read -r START END NAME; do
 
-          if [ ! -s "$OUTPUT_FILE" ]; then
-            echo "Output file was not created or is empty."
-            exit 1
-          fi
+            OUTPUT_FILE="out/${NAME}.mp4"
 
-          echo "================================"
-          echo "Output information"
-          echo "================================"
+            if [ ! -s "$OUTPUT_FILE" ]; then
+              echo "Output file was not created or is empty: $OUTPUT_FILE"
+              exit 1
+            fi
 
-          ls -lh "$OUTPUT_FILE"
+            echo "================================"
+            echo "Output information: $NAME"
+            echo "================================"
 
-          ffprobe \
-            -hide_banner \
-            -v error \
-            -show_entries \
-            format=duration,size,format_name \
-            -show_entries \
-            stream=index,codec_name,codec_type,width,height \
-            -of default=noprint_wrappers=1 \
-            "$OUTPUT_FILE"
+            ls -lh "$OUTPUT_FILE"
+
+            ffprobe \
+              -hide_banner \
+              -v error \
+              -show_entries \
+              format=duration,size,format_name \
+              -show_entries \
+              stream=index,codec_name,codec_type,width,height \
+              -of default=noprint_wrappers=1 \
+              "$OUTPUT_FILE" < /dev/null
+
+            echo
+
+          done < cuts.txt
 
       # ----------------------------------------
-      # 7. Upload result
+      # 7. Upload results
       # ----------------------------------------
-      - name: Upload cut video
+      - name: Upload cut videos
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.file_name }}
-          path: ${{ inputs.file_name }}.mp4
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/*.mp4
           if-no-files-found: error
           retention-days: 1
           # mp4 is already compressed; skipping zip compression is faster
@@ -703,6 +815,8 @@ jobs:
         run: |
 
           rm -f download.py
+          rm -f cuts.txt
           rm -f "$MEDIA_FILE"
+          rm -rf out
 
           echo "Cleanup completed."
