@@ -35,7 +35,7 @@ jobs:
       OUTPUT_NAME: ${{ inputs.file_name }}
       MEDIA_FILE: input_media
       # Number of parallel download segments (try 4 to 16)
-      DOWNLOAD_SEGMENTS: "8"
+      DOWNLOAD_SEGMENTS: "16"
 
     steps:
 
